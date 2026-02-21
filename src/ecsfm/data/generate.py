@@ -61,7 +61,7 @@ def _run_single_sim(args):
     E_arr, t_max, params, nx = args
     D_ox, D_red, C_ox, C_red, E0, k0, alpha = params
     
-    _, C_ox_hist, C_red_hist, _, _, E_hist_vis, I_hist_vis = simulate_electrochem(
+    _, C_ox_hist, C_red_hist, E_hist, I_hist, E_hist_vis, I_hist_vis = simulate_electrochem(
         E_array=E_arr,
         t_max=t_max,
         D_ox=D_ox,
@@ -74,7 +74,34 @@ def _run_single_sim(args):
         nx=nx,
         save_every=0
     )
-    return C_ox_hist[-1], C_red_hist[-1], I_hist_vis, E_hist_vis
+    
+    from ecsfm.sim.sensor import apply_sensor_model
+    
+    # 1. Reconstruct exact high-res time array native to simulator
+    t_array = jnp.linspace(0, t_max, len(E_hist))
+    
+    # 2. Add realistic potentiostat RC low-pass filter (EIS response)
+    # Using typical moderate uncompensated resistance and double layer capacitance
+    Cdl = 1e-5  # 10 uF
+    Ru = 100.0  # 100 Ohms
+    
+    # Apply sensor model to capture real voltage at interface and capacitive current
+    E_real, I_total_mA, _ = apply_sensor_model(
+        t=t_array,
+        E_app=jnp.array(E_hist),
+        I_f_mA=jnp.array(I_hist),
+        Cdl=Cdl,
+        Ru=Ru,
+        noise_std_mA=0.0
+    )
+    
+    # We thin down the measured total current back to the visualization rate for the ML dataset
+    save_every = max(1, len(E_hist) // 200)
+    I_total_vis = I_total_mA[::save_every]
+    
+    # The experimentalist only knows the commanded applied potential (E_hist), not E_real!
+    # So the dataset condition remains E_hist.
+    return C_ox_hist[-1], C_red_hist[-1], I_total_vis, E_hist_vis
 
 def generate_multi_species_dataset(n_samples: int, key: jax.random.PRNGKey, max_species: int = 5):
     print(f"Generating Multi-Species dataset of {n_samples} diverse physics simulations...")
@@ -104,13 +131,13 @@ def generate_multi_species_dataset(n_samples: int, key: jax.random.PRNGKey, max_
         alpha_arr = np.ones(max_species) * 0.5
         
         for s in range(num_active):
-            D_ox_arr[s] = float(np.exp(rng.uniform(np.log(1e-6), np.log(1e-4))))
-            D_red_arr[s] = float(np.exp(rng.uniform(np.log(1e-6), np.log(1e-4))))
-            C_ox_arr[s] = float(rng.uniform(0.1, 5.0))
-            C_red_arr[s] = float(rng.uniform(0.0, 1.0))
-            E0_arr[s] = float(rng.uniform(-0.5, 0.5))
-            k0_arr[s] = float(np.exp(rng.uniform(np.log(1e-3), np.log(1e-1))))
-            alpha_arr[s] = float(rng.uniform(0.3, 0.7))
+            D_ox_arr[s] = float(np.exp(rng.uniform(np.log(1e-7), np.log(1e-4))))
+            D_red_arr[s] = float(np.exp(rng.uniform(np.log(1e-7), np.log(1e-4))))
+            C_ox_arr[s] = float(rng.uniform(0.1, 10.0))
+            C_red_arr[s] = float(rng.uniform(0.0, 5.0))
+            E0_arr[s] = float(rng.uniform(-0.8, 0.8))
+            k0_arr[s] = float(np.exp(rng.uniform(np.log(1e-6), np.log(1e0))))
+            alpha_arr[s] = float(rng.uniform(0.1, 0.9))
             
         params = (D_ox_arr, D_red_arr, C_ox_arr, C_red_arr, E0_arr, k0_arr, alpha_arr)
         
@@ -120,16 +147,18 @@ def generate_multi_species_dataset(n_samples: int, key: jax.random.PRNGKey, max_
         ])
         phys_params.append(flat_params)
         
-        # Randomize Waveforms
-        wave_type = rng.choice(["cv", "ca", "eis"])
+        # Randomize Waveforms (Heavily diversified)
+        wave_type = rng.choice(["cv", "ca", "eis", "swv"])
         if wave_type == "cv":
-            scan_rate = rng.uniform(0.01, 1.0)
-            E, t_max = get_cv_waveform(0.5, -0.5, scan_rate)
+            scan_rate = rng.uniform(0.005, 5.0)
+            E, t_max = get_cv_waveform(rng.uniform(0.1, 0.8), rng.uniform(-0.8, -0.1), scan_rate)
         elif wave_type == "ca":
-            E, t_max = get_ca_waveform(0.0, rng.uniform(-0.8, 0.8), 2.0, 0.5)
+            E, t_max = get_ca_waveform(0.0, rng.uniform(-1.0, 1.0), 3.0, 0.5)
+        elif wave_type == "swv":
+            E, t_max = get_swv_waveform(rng.uniform(0.1, 0.5), rng.uniform(-0.5, -0.1), 0.01, rng.uniform(0.02, 0.1), rng.uniform(5.0, 50.0))
         else:
-            freq = rng.uniform(1.0, 100.0)
-            E, t_max = get_eis_waveform(0.0, rng.uniform(0.01, 0.1), freq, 2.0)
+            freq = rng.uniform(0.1, 1000.0)
+            E, t_max = get_eis_waveform(rng.uniform(-0.5, 0.5), rng.uniform(0.01, 0.2), freq, 3.0)
             
         sim_args.append((E, t_max, params, nx))
         
@@ -163,18 +192,24 @@ def main():
     os.system("open /tmp/ecsfm")
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n-samples", type=int, default=100)
+    parser.add_argument("--n-samples", type=int, default=5000, help="Samples per chunk")
+    parser.add_argument("--n-chunks", type=int, default=1, help="Number of chunks to generate")
     parser.add_argument("--max-species", type=int, default=5)
-    parser.add_argument("--output", type=str, default="/tmp/ecsfm/dataset_multi_species.npz")
+    parser.add_argument("--output-dir", type=str, default="/tmp/ecsfm/dataset_massive")
     args = parser.parse_args()
     
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
     
-    key = jax.random.PRNGKey(42)
-    c_ox, c_red, curr, sigs, params = generate_multi_species_dataset(args.n_samples, key, args.max_species)
-    
-    np.savez(args.output, ox=c_ox, red=c_red, i=curr, e=sigs, p=params)
-    print(f"Successfully generated and saved {args.n_samples} multi-species trajectories to {args.output}")
+    for chunk in range(args.n_chunks):
+        key = jax.random.PRNGKey(42 + chunk)
+        print(f"\n--- Generating Chunk {chunk+1}/{args.n_chunks} ---")
+        c_ox, c_red, curr, sigs, params = generate_multi_species_dataset(args.n_samples, key, args.max_species)
+        
+        chunk_path = os.path.join(args.output_dir, f"chunk_{chunk}.npz")
+        np.savez(chunk_path, ox=c_ox, red=c_red, i=curr, e=sigs, p=params)
+        print(f"Saved chunk {chunk} to {chunk_path}")
+        
+    print(f"\nSuccessfully generated {args.n_chunks * args.n_samples} total massive edge-case trajectories!")
 
 
 if __name__ == "__main__":

@@ -23,8 +23,25 @@ from ecsfm.data.generate import get_cv_waveform, get_swv_waveform, get_ca_wavefo
 
 def get_normalizers(data_path: str, seed: int = 42, val_split: float = 0.2):
     """Replicates the normalizer extraction from train.py to ensure identical normalization."""
-    data = np.load(data_path)
-    c_ox, c_red, curr, sigs, params = data['ox'], data['red'], data['i'], data['e'], data['p']
+    import glob
+    if os.path.isdir(data_path):
+        chunk_files = glob.glob(os.path.join(data_path, "*.npz"))
+        all_ox, all_red, all_i, all_e, all_p = [], [], [], [], []
+        for cf in chunk_files:
+            data = np.load(cf)
+            all_ox.append(data['ox'])
+            all_red.append(data['red'])
+            all_i.append(data['i'])
+            all_e.append(data['e'])
+            all_p.append(data['p'])
+        c_ox = np.concatenate(all_ox, axis=0)
+        c_red = np.concatenate(all_red, axis=0)
+        curr = np.concatenate(all_i, axis=0)
+        sigs = np.concatenate(all_e, axis=0)
+        params = np.concatenate(all_p, axis=0)
+    else:
+        data = np.load(data_path)
+        c_ox, c_red, curr, sigs, params = data['ox'], data['red'], data['i'], data['e'], data['p']
     
     c_ox, c_red, curr, sigs, params = jnp.array(c_ox), jnp.array(c_red), jnp.array(curr), jnp.array(sigs), jnp.array(params)
     dataset_x = jnp.concatenate([c_ox, c_red, curr], axis=1)
@@ -181,7 +198,7 @@ def run_classical_eval(name, E_t, t_max, params, model, norm, key, nx=50, target
 
 def main():
     checkpoint_path = "/tmp/ecsfm/surrogate_model.eqx"
-    data_path = "/tmp/ecsfm/dataset_multi_species.npz"
+    data_path = "/tmp/ecsfm/dataset_massive"
     
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Model checkpoint not found at {checkpoint_path}")

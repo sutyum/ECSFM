@@ -153,18 +153,42 @@ def save_comparison(model, epoch, state_dim, nx, key, e_mean, e_std, p_mean, p_s
 
 def train_surrogate(config: FlowConfig, data_path: str):
     import numpy as np
+    import glob
+    
     key = jax.random.PRNGKey(np.uint32(config.seed))
     key, subkey = jax.random.split(key)
     
     os.system("open /tmp/ecsfm")
     os.makedirs("/tmp/ecsfm", exist_ok=True)
     
-    if not os.path.exists(data_path):
-        raise FileNotFoundError(f"Dataset block not found at {data_path}. Please run python -m ecsfm.data.generate first to amass a database block.")
-        
-    print(f"Loading massive pre-computed multi-species dataset from {data_path}...")
-    data = np.load(data_path)
-    c_ox, c_red, curr, sigs, params = data['ox'], data['red'], data['i'], data['e'], data['p']
+    if os.path.isdir(data_path):
+        print(f"Loading massive chunked dataset from directory {data_path}...")
+        chunk_files = glob.glob(os.path.join(data_path, "*.npz"))
+        if not chunk_files:
+            raise FileNotFoundError(f"No .npz chunks found in {data_path}")
+            
+        all_ox, all_red, all_i, all_e, all_p = [], [], [], [], []
+        for cf in tqdm(chunk_files, desc="Aggregating Chunks"):
+            data = np.load(cf)
+            all_ox.append(data['ox'])
+            all_red.append(data['red'])
+            all_i.append(data['i'])
+            all_e.append(data['e'])
+            all_p.append(data['p'])
+            
+        c_ox = np.concatenate(all_ox, axis=0)
+        c_red = np.concatenate(all_red, axis=0)
+        curr = np.concatenate(all_i, axis=0)
+        sigs = np.concatenate(all_e, axis=0)
+        params = np.concatenate(all_p, axis=0)
+        print(f"Total Aggregated Dataset Size: {len(c_ox)} simulation trajectories")
+    else:
+        if not os.path.exists(data_path):
+            raise FileNotFoundError(f"Dataset not found at {data_path}.")
+            
+        print(f"Loading pre-computed dataset from {data_path}...")
+        data = np.load(data_path)
+        c_ox, c_red, curr, sigs, params = data['ox'], data['red'], data['i'], data['e'], data['p']
     
     # Optional subset if n_samples explicitly overrides
     if config.n_samples > 0 and config.n_samples < c_ox.shape[0]:
@@ -340,7 +364,7 @@ def train_surrogate(config: FlowConfig, data_path: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Train Flow Matching Surrogate")
-    parser.add_argument("--dataset", "--data-path", dest="data_path", type=str, default="/tmp/ecsfm/dataset_multi_species.npz", help="Path to precomputed dataset NPZ chunk")
+    parser.add_argument("--dataset", "--data-path", dest="data_path", type=str, default="/tmp/ecsfm/dataset_massive", help="Path to precomputed dataset NPZ chunk or directory of chunks")
     parser.add_argument("--n-samples", type=int, default=0, help="Number of trajectories to use. 0 = use all in chunk")
     parser.add_argument("--epochs", type=int, default=500, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
