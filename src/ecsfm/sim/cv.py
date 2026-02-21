@@ -141,9 +141,9 @@ def simulate_cv(
         jnp.arange(n_steps)
     )
     
-    # Thin the history down for visualization
-    C_ox_hist = C_ox_hist[::save_every]
-    C_red_hist = C_red_hist[::save_every]
+    # Thin the history down for visualization and convert back to mM for consistent output scaling
+    C_ox_hist = C_ox_hist[::save_every] * 1e6
+    C_red_hist = C_red_hist[::save_every] * 1e6
     E_hist_vis = E_hist[::save_every]
     I_hist_vis = I_hist[::save_every]
     
