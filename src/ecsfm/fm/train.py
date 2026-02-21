@@ -340,7 +340,7 @@ def train_surrogate(config: FlowConfig, data_path: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Train Flow Matching Surrogate")
-    parser.add_argument("--data-path", type=str, default="/tmp/ecsfm/dataset_multi_species.npz", help="Path to precomputed dataset NPZ chunk")
+    parser.add_argument("--dataset", "--data-path", dest="data_path", type=str, default="/tmp/ecsfm/dataset_multi_species.npz", help="Path to precomputed dataset NPZ chunk")
     parser.add_argument("--n-samples", type=int, default=0, help="Number of trajectories to use. 0 = use all in chunk")
     parser.add_argument("--epochs", type=int, default=500, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
