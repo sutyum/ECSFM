@@ -5,6 +5,16 @@ build/
 dist/
 wheels/
 *.egg-info
+.uv_cache/
+.pytest_cache/
 
 # Virtual environments
 .venv
+
+tune_configs/
+*.npy
+*.npz
+
+*.png
+
+!dataset_cache.npy
