@@ -5,7 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
-.uv_cache/
+.uv_cache*/
 .pytest_cache/
 
 # Virtual environments
@@ -16,5 +16,7 @@ tune_configs/
 *.npz
 
 *.png
+
+training_history.json
 
 !dataset_cache.npy

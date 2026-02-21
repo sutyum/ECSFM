@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 import concurrent.futures
 import multiprocessing
 
-from ecsfm.sim.cv import simulate_cv
+from ecsfm.sim.experiment import simulate_electrochem
 from ecsfm.fm.model import VectorFieldNet
 from ecsfm.fm.objective import flow_matching_loss
 
@@ -38,163 +38,198 @@ class FlowConfig(BaseModel):
     val_split: float = Field(0.2, description="Fraction of dataset to use for validation")
 
 
-def integrate_flow(model, x0, n_steps=100):
+def integrate_flow(model, x0, E, p, n_steps=100):
     dt = 1.0 / n_steps
-    x = x0
+    x = x0.astype(jnp.float32)
+    E = E.astype(jnp.float32)
+    p = p.astype(jnp.float32)
     for i in range(n_steps):
         t = i * dt
         t_batch = jnp.full((x.shape[0], 1), t)
-        v = jax.vmap(model)(t_batch, x)
+        v = jax.vmap(model)(t_batch, x, E, p)
         x = x + v * dt
     return x
 
-def _run_single_sim(args):
-    D_ox, k0, scan_rate, nx = args
-    _, C_ox_hist, _, _, _, _ = simulate_cv(
-        D_ox=D_ox,
-        D_red=D_ox, 
-        k0=k0,
-        scan_rate=scan_rate,
-        nx=nx,
-        save_every=0
-    )
-    return C_ox_hist[-1]
-
-def generate_training_data(n_samples: int, key: jax.random.PRNGKey) -> jax.Array:
-    print(f"Generating dataset of {n_samples} physics simulations...")
-    nx = 50
-    final_states = []
-    keys = jax.random.split(key, n_samples)
-    
-    # Pre-generate random args to feed into the parallel executor
-    sim_args = []
-    for i in range(n_samples):
-        k1, k2, k3 = jax.random.split(keys[i], 3)
-        D_ox = float(jnp.exp(jax.random.uniform(k1, minval=jnp.log(1e-6), maxval=jnp.log(1e-4))))
-        k0 = float(jnp.exp(jax.random.uniform(k2, minval=jnp.log(1e-3), maxval=jnp.log(1e-1))))
-        scan_rate = float(jax.random.uniform(k3, minval=0.01, maxval=1.0))
-        sim_args.append((D_ox, k0, scan_rate, nx))
-        
-    # Parallel dispatch across all available CPU cores
-    max_workers = max(1, multiprocessing.cpu_count() - 1)
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-        for result in tqdm(executor.map(_run_single_sim, sim_args), total=n_samples, desc="Simulating Physical Trajectories"):
-            final_states.append(result)
-            
-    return jnp.stack(final_states)
-
 @eqx.filter_value_and_grad
-def compute_loss(model, x1, x0, key):
-    return flow_matching_loss(model, x1, x0, key)
+def compute_loss(model, x1, x0, E, p, key):
+    return flow_matching_loss(model, x1, x0, E, p, key)
 
 @eqx.filter_jit
-def compute_val_loss(model, x1, x0, key):
-    return flow_matching_loss(model, x1, x0, key)
+def compute_val_loss(model, x1, x0, E, p, key):
+    return flow_matching_loss(model, x1, x0, E, p, key)
 
-def save_comparison(model, epoch, state_dim, key, data_mean=0.0, data_std=1.0):
-    print(f"Generating surrogate comparison for epoch {epoch}...")
-    n_samples = 50
+def save_comparison(model, epoch, state_dim, nx, key, e_mean, e_std, p_mean, p_std):
+    print(f"Generating multi-task surrogate comparison for epoch {epoch}...")
+    n_samples = 4
     sample_key, _ = jax.random.split(key)
-    x0 = jax.random.normal(sample_key, (n_samples, state_dim))
-    x_generated = integrate_flow(model, x0, n_steps=100)
-    x_generated = x_generated * data_std + data_mean
     
-    gt_samples = []
+    from ecsfm.data.generate import get_cv_waveform
+    
+    gt_ox, gt_red, gt_i, e_raw, p_raw = [], [], [], [], []
     keys = jax.random.split(key, n_samples)
+    target_len = 200
     for i in range(n_samples):
-        k1, k2, k3 = jax.random.split(keys[i], 3)
-        D_ox = jnp.exp(jax.random.uniform(k1, minval=jnp.log(1e-6), maxval=jnp.log(1e-4)))
-        k0 = jnp.exp(jax.random.uniform(k2, minval=jnp.log(1e-3), maxval=jnp.log(1e-1)))
-        scan_rate = jax.random.uniform(k3, minval=0.01, maxval=1.0)
-        _, C_ox_hist, _, _, _, _ = simulate_cv(
-            D_ox=float(D_ox),
-            D_red=float(D_ox), 
-            k0=float(k0),
-            scan_rate=float(scan_rate),
-            nx=state_dim,
-            save_every=0
+        k1, k2 = jax.random.split(keys[i])
+        E_start, E_vertex, scan_rate = 0.5, -0.5, 0.1
+        E_t, t_max = get_cv_waveform(E_start, E_vertex, scan_rate)
+        
+        # Build test arrays for max_species = 5. Assume 2 active species for the visualization plot.
+        D_ox = np.ones(5) * 1e-5
+        D_red = np.ones(5) * 1e-5
+        C_ox = np.zeros(5)
+        C_red = np.zeros(5)
+        E0 = np.zeros(5)
+        k0 = np.ones(5) * 0.01
+        alpha = np.ones(5) * 0.5
+        
+        # 2 active species with distinct peaks
+        C_ox[0] = 1.0; E0[0] = 0.1
+        C_ox[1] = 0.5; E0[1] = -0.2
+        
+        params = (D_ox, D_red, C_ox, C_red, E0, k0, alpha)
+        
+        flat_params = np.concatenate([
+            np.log(D_ox), np.log(D_red), C_ox, C_red, E0, np.log(k0), alpha
+        ])
+        p_raw.append(flat_params)
+        
+        _, C_ox_hist, C_red_hist, _, _, E_hist_vis, I_hist_vis = simulate_electrochem(
+            E_array=E_t, t_max=t_max, D_ox=D_ox, D_red=D_red, C_bulk_ox=C_ox, 
+            C_bulk_red=C_red, E0=E0, k0=k0, alpha=alpha, nx=nx, save_every=0
         )
-        gt_samples.append(C_ox_hist[-1])
+        gt_ox.append(C_ox_hist[-1].flatten())
+        gt_red.append(C_red_hist[-1].flatten())
         
-    gt_samples = np.array(gt_samples)
-    x_generated = np.array(x_generated)
+        orig_indices = np.linspace(0, 1, len(E_hist_vis))
+        target_indices = np.linspace(0, 1, target_len)
+        e_raw.append(np.interp(target_indices, orig_indices, E_hist_vis))
+        gt_i.append(np.interp(target_indices, orig_indices, I_hist_vis))
+            
+    e_raw_arr = jnp.array(e_raw)
+    p_raw_arr = jnp.array(p_raw)
+    e_normalized = (e_raw_arr - e_mean) / e_std
+    p_normalized = (p_raw_arr - p_mean) / p_std
     
-    gen_mean, gen_std = x_generated.mean(axis=0), x_generated.std(axis=0)
-    gt_mean, gt_std = gt_samples.mean(axis=0), gt_samples.std(axis=0)
+    x0 = jax.random.normal(sample_key, (n_samples, state_dim))
+    x_generated = integrate_flow(model, x0, e_normalized, p_normalized, n_steps=100)
     
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle(f"Surrogate Distribution Comparison - Epoch {epoch}", fontsize=16)
+    # We do not unnormalize purely for visual inspection comparison right now, 
+    # but we will just compare normalized GT vs Normalized Gen shapes.
+    # To do full unnormalization we'd need to pass ox_mean, ox_std, etc.
+    # For now, let's just plot the generated distributions vs ground truth.
     
-    axes[0].set_title(f"Generated Samples ({n_samples})\n(From base Gaussian noise)")
-    axes[0].set_xlabel("Distance [cm] (Grid Index)")
-    axes[0].set_ylabel("Concentration [mM]")
+    fig, axes = plt.subplots(n_samples, 3, figsize=(15, 4 * n_samples))
+    fig.suptitle(f"Multi-Task Generation - Epoch {epoch}", fontsize=16)
+    
     for i in range(n_samples):
-        axes[0].plot(x_generated[i], color='royalblue', alpha=0.15)
+        # Extract components from generated joint vector
+        # x_generated is shape (batch, nx + nx + target_len)
+        gen_ox = x_generated[i, :nx]
+        gen_red = x_generated[i, nx:2*nx]
+        gen_current = x_generated[i, 2*nx:]
         
-    axes[1].set_title(f"Ground Truth Samples ({n_samples})\n(From Physical Simulator)")
-    axes[1].set_xlabel("Distance [cm] (Grid Index)")
-    for i in range(n_samples):
-        axes[1].plot(gt_samples[i], color='crimson', alpha=0.15)
+        ax1 = axes[i, 0] if n_samples > 1 else axes[0]
+        ax2 = axes[i, 1] if n_samples > 1 else axes[1]
+        ax3 = axes[i, 2] if n_samples > 1 else axes[2]
         
-    axes[2].set_title(f"Distribution Statistics Overlap\n(Mean \u00b1 1 Std Dev)")
-    axes[2].set_xlabel("Distance [cm] (Grid Index)")
-    x_axis = np.arange(state_dim)
-    axes[2].plot(gen_mean, color='royalblue', label='Generated Mean')
-    axes[2].fill_between(x_axis, gen_mean - gen_std, gen_mean + gen_std, color='royalblue', alpha=0.2)
-    
-    axes[2].plot(gt_mean, color='crimson', label='Ground Truth Mean', linestyle='--')
-    axes[2].fill_between(x_axis, gt_mean - gt_std, gt_mean + gt_std, color='crimson', alpha=0.2)
-    axes[2].legend()
-    
+        ax1.plot(gen_ox, label='Gen Ox', color='blue')
+        ax1.plot(gen_red, label='Gen Red', color='red')
+        ax1.set_title("Generated States")
+        ax1.legend()
+        
+        ax2.plot(gt_ox[i], label='GT Ox', color='blue', linestyle='--')
+        ax2.plot(gt_red[i], label='GT Red', color='red', linestyle='--')
+        ax2.set_title("Ground Truth States")
+        ax2.legend()
+        
+        ax3.plot(gen_current, label='Gen Current', color='green')
+        ax3.plot(gt_i[i], label='GT Current', color='green', linestyle='--')
+        ax3.set_title("Current Observable (I(t))")
+        ax3.legend()
+        
     plt.tight_layout()
-    plt.savefig(f"surrogate_comparison_ep{epoch}.png")
+    plt.savefig(f"/tmp/ecsfm/surrogate_comparison_ep{epoch}.png")
     plt.close()
 
-def train_surrogate(config: FlowConfig):
+def train_surrogate(config: FlowConfig, data_path: str):
     import numpy as np
     key = jax.random.PRNGKey(np.uint32(config.seed))
     key, subkey = jax.random.split(key)
     
-    dataset_file = "dataset_cache.npy"
-    if os.path.exists(dataset_file) and not config.new_run:
-        print("Loading cached dataset...")
-        dataset = jnp.load(dataset_file)
-        if dataset.shape[0] < config.n_samples:
-            print("Cached dataset too small, generating a new one...")
-            dataset = generate_training_data(config.n_samples, subkey)
-            jnp.save(dataset_file, dataset)
-        else:
-            dataset = dataset[:config.n_samples]
-    else:
-        dataset = generate_training_data(config.n_samples, subkey)
-        jnp.save(dataset_file, dataset)
+    os.system("open /tmp/ecsfm")
+    os.makedirs("/tmp/ecsfm", exist_ok=True)
+    
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Dataset block not found at {data_path}. Please run python -m ecsfm.data.generate first to amass a database block.")
+        
+    print(f"Loading massive pre-computed multi-species dataset from {data_path}...")
+    data = np.load(data_path)
+    c_ox, c_red, curr, sigs, params = data['ox'], data['red'], data['i'], data['e'], data['p']
+    
+    # Optional subset if n_samples explicitly overrides
+    if config.n_samples > 0 and config.n_samples < c_ox.shape[0]:
+        c_ox = c_ox[:config.n_samples]
+        c_red = c_red[:config.n_samples]
+        curr = curr[:config.n_samples]
+        sigs = sigs[:config.n_samples]
+        params = params[:config.n_samples]
+        
+    c_ox, c_red, curr, sigs, params = jnp.array(c_ox), jnp.array(c_red), jnp.array(curr), jnp.array(sigs), jnp.array(params)
+    
+    # Combine tasks into a master ground-truth vector: [Ox(x), Red(x), I(t)]
+    # This teaches the model the joint distribution of physics and observables
+    dataset_x = jnp.concatenate([c_ox, c_red, curr], axis=1)
     
     key, subkey = jax.random.split(key)
-    indices = jax.random.permutation(subkey, len(dataset))
-    dataset = dataset[indices]
+    indices = jax.random.permutation(subkey, len(dataset_x))
+    dataset_x = dataset_x[indices]
+    sigs = sigs[indices]
+    params = params[indices]
     
-    state_dim = dataset.shape[1]
-    val_size = max(1, int(len(dataset) * config.val_split))
-    train_dataset = dataset[:-val_size]
-    val_dataset = dataset[-val_size:]
+    state_dim = dataset_x.shape[1]
+    val_size = max(1, int(len(dataset_x) * config.val_split))
     
-    data_mean = jnp.mean(train_dataset, axis=0)
-    data_std = jnp.std(train_dataset, axis=0) + 1e-5
+    train_x = dataset_x[:-val_size]
+    val_x = dataset_x[-val_size:]
+    train_e = sigs[:-val_size]
+    val_e = sigs[-val_size:]
+    train_p = params[:-val_size]
+    val_p = params[-val_size:]
     
-    train_dataset = (train_dataset - data_mean) / data_std
-    val_dataset = (val_dataset - data_mean) / data_std
+    # Normalizing States + Observables (we'll just use global normalizers for the joint vector for this demo)
+    x_mean = jnp.mean(train_x, axis=0)
+    x_std = jnp.std(train_x, axis=0) + 1e-5
     
-    print(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
+    e_mean = jnp.mean(train_e, axis=0)
+    e_std = jnp.std(train_e, axis=0) + 1e-5
+    
+    p_mean = jnp.mean(train_p, axis=0)
+    p_std = jnp.std(train_p, axis=0) + 1e-5
+    
+    train_x = (train_x - x_mean) / x_std
+    val_x = (val_x - x_mean) / x_std
+    train_e = (train_e - e_mean) / e_std
+    val_e = (val_e - e_mean) / e_std
+    train_p = (train_p - p_mean) / p_std
+    val_p = (val_p - p_mean) / p_std
+    
+    print(f"Train size: {len(train_x)}, Val size: {len(val_x)}")
+    
+    nx = 50 # Our grid dimension
+    cond_dim = 32 # Encoded size of the signal
+    phys_dim = params.shape[1] # 7
     
     key, subkey = jax.random.split(key)
     model = VectorFieldNet(
         state_dim=state_dim,
         hidden_size=config.hidden_size,
         depth=config.depth,
+        cond_dim=cond_dim,
+        phys_dim=phys_dim,
         key=subkey
     )
     
-    checkpoint_path = "surrogate_model.eqx"
+    checkpoint_path = "/tmp/ecsfm/surrogate_model.eqx"
     start_epoch = 0
     history = {'train': [], 'val': []}
     
@@ -202,8 +237,8 @@ def train_surrogate(config: FlowConfig):
         try:
             model = eqx.tree_deserialise_leaves(checkpoint_path, model)
             print("Loaded existing checkpoint: resuming from", checkpoint_path)
-            if os.path.exists("training_history.json"):
-                with open("training_history.json", "r") as f:
+            if os.path.exists("/tmp/ecsfm/training_history.json"):
+                with open("/tmp/ecsfm/training_history.json", "r") as f:
                     saved_history = json.load(f)
                     history = saved_history.get('history', {'train': [], 'val': []})
                     start_epoch = saved_history.get('epoch', 0)
@@ -215,30 +250,34 @@ def train_surrogate(config: FlowConfig):
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
     
     @eqx.filter_jit
-    def make_step(model, opt_state, x1, x0, step_key):
-        loss, grads = compute_loss(model, x1, x0, step_key)
+    def make_step(model, opt_state, x1, x0, E, p, step_key):
+        loss, grads = compute_loss(model, x1, x0, E, p, step_key)
         updates, opt_state = optimizer.update(grads, opt_state, model)
         model = eqx.apply_updates(model, updates)
         return model, opt_state, loss
     
-    print("Training Flow Matching Surrogate...")
+    print("Training Conditional Flow Matching Surrogate...")
     
     pbar = tqdm(range(start_epoch, config.epochs), desc="Training Phase")
     for epoch in pbar:
         key, subkey = jax.random.split(key)
         
-        perms = jax.random.permutation(subkey, len(train_dataset))
-        shuffled_x1 = train_dataset[perms]
+        perms = jax.random.permutation(subkey, len(train_x))
+        shuffled_x1 = train_x[perms]
+        shuffled_e = train_e[perms]
+        shuffled_p = train_p[perms]
         
         epoch_loss = 0.0
         n_batches = 0
         
-        for i in range(0, len(train_dataset), config.batch_size):
+        for i in range(0, len(train_x), config.batch_size):
             batch_x1 = shuffled_x1[i:i + config.batch_size]
+            batch_e = shuffled_e[i:i + config.batch_size]
+            batch_p = shuffled_p[i:i + config.batch_size]
             key, sample_key, step_key = jax.random.split(key, 3)
             batch_x0 = jax.random.normal(sample_key, batch_x1.shape)
             
-            model, opt_state, loss = make_step(model, opt_state, batch_x1, batch_x0, step_key)
+            model, opt_state, loss = make_step(model, opt_state, batch_x1, batch_x0, batch_e, batch_p, step_key)
             epoch_loss += loss
             n_batches += 1
             
@@ -247,14 +286,14 @@ def train_surrogate(config: FlowConfig):
         
         if epoch % 1000 == 0 or epoch == config.epochs - 1:
             key, sample_key, step_key = jax.random.split(key, 3)
-            val_x0 = jax.random.normal(sample_key, val_dataset.shape)
-            val_loss = compute_val_loss(model, val_dataset, val_x0, step_key)
+            val_x0 = jax.random.normal(sample_key, val_x.shape)
+            val_loss = compute_val_loss(model, val_x, val_x0, val_e, val_p, step_key)
             history['val'].append((epoch, float(val_loss)))
             pbar.set_postfix({"Train Loss": f"{avg_loss:.5f}", "Val Loss": f"{val_loss:.5f}"})
             
         if epoch > start_epoch and epoch % 10000 == 0:
             eqx.tree_serialise_leaves(checkpoint_path, model)
-            with open("training_history.json", "w") as f:
+            with open("/tmp/ecsfm/training_history.json", "w") as f:
                 json.dump({'history': history, 'epoch': epoch}, f)
             print(f"Checkpoint saved at epoch {epoch}")
             
@@ -269,18 +308,18 @@ def train_surrogate(config: FlowConfig):
             plt.ylabel("OT-CFM Loss")
             plt.yscale('log')
             plt.legend()
-            plt.savefig("loss_curve.png")
+            plt.savefig("/tmp/ecsfm/loss_curve.png")
             plt.close()
             
-            save_comparison(model, epoch, state_dim, subkey, data_mean, data_std)
+            save_comparison(model, epoch, state_dim, nx, subkey, e_mean, e_std, p_mean, p_std)
             
     avg_loss = history['train'][-1] if history.get('train') else 0.0
     print(f"Final Epoch | Loss: {avg_loss:.5f}")
     
     eqx.tree_serialise_leaves(checkpoint_path, model)
-    with open("training_history.json", "w") as f:
+    with open("/tmp/ecsfm/training_history.json", "w") as f:
         json.dump({'history': history, 'epoch': config.epochs}, f)
-    print("Saved Flow Matching final model weights to surrogate_model.eqx")
+    print("Saved Flow Matching final model weights to /tmp/ecsfm/surrogate_model.eqx")
     
     # Always plot and verify the surrogate at the very end of any run
     if history.get('train'):
@@ -294,41 +333,35 @@ def train_surrogate(config: FlowConfig):
         plt.ylabel("OT-CFM Loss")
         plt.yscale('log')
         plt.legend()
-        plt.savefig("loss_curve.png")
+        plt.savefig("/tmp/ecsfm/loss_curve.png")
         plt.close()
         
-    save_comparison(model, config.epochs, state_dim, subkey, data_mean, data_std)
+    save_comparison(model, config.epochs, state_dim, nx, subkey, e_mean, e_std, p_mean, p_std)
 
-def load_config_with_cli_overrides() -> FlowConfig:
+def main():
     parser = argparse.ArgumentParser(description="Train Flow Matching Surrogate")
-    parser.add_argument("--config", type=str, default="config.json", help="Path to JSON config file. Overridden by CLI args.")
+    parser.add_argument("--data-path", type=str, default="/tmp/ecsfm/dataset_multi_species.npz", help="Path to precomputed dataset NPZ chunk")
+    parser.add_argument("--n-samples", type=int, default=0, help="Number of trajectories to use. 0 = use all in chunk")
+    parser.add_argument("--epochs", type=int, default=500, help="Number of training epochs")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--hidden-size", type=int, default=128, help="Hidden size for VectorFieldNet")
+    parser.add_argument("--depth", type=int, default=3, help="Depth for VectorFieldNet")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--new-run", action="store_true", help="Start training from scratch, ignoring checkpoints")
+    parser.add_argument("--val-split", type=float, default=0.2, help="Fraction of dataset to use for validation")
     
-    early_args, remaining_args = parser.parse_known_args()
+    args = parser.parse_args()
     
-    if os.path.exists(early_args.config):
-        import json
-        with open(early_args.config, "r") as f:
-            file_data = json.load(f)
-            config = FlowConfig(**file_data)
-            print(f"Loaded base config from {early_args.config}")
-    else:
-        config = FlowConfig() 
+    # Pack into simple object for compatibility
+    class Config:
+        pass
+    
+    config = Config()
+    for k, v in vars(args).items():
+        setattr(config, k, v)
         
-    for key, field_info in FlowConfig.model_fields.items():
-        flag_name = f"--{key.replace('_', '-')}"
-        if field_info.annotation is bool:
-            parser.add_argument(flag_name, action="store_true", default=argparse.SUPPRESS, help=field_info.description)
-        else:
-            parser.add_argument(flag_name, type=field_info.annotation, default=argparse.SUPPRESS, help=field_info.description)
-
-    final_args = parser.parse_args(remaining_args)
-    
-    cli_overrides = vars(final_args)
-    cli_overrides.pop('config', None) 
-    
-    config = config.model_copy(update=cli_overrides)
-    return config
+    train_surrogate(config, args.data_path)
 
 if __name__ == "__main__":
-    final_config = load_config_with_cli_overrides()
-    train_surrogate(final_config)
+    main()
