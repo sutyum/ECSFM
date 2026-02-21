@@ -1,0 +1,22 @@
+[project]
+name = "ecsfm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Satyam Tiwary", email = "satyam@technoculture.io" }
+]
+requires-python = ">=3.9"
+dependencies = [
+    "equinox>=0.11.10",
+    "jax>=0.4.30",
+    "jaxlib>=0.4.30",
+    "jaxtyping>=0.2.36",
+    "matplotlib>=3.9.4",
+    "optax>=0.2.4",
+    "pytest>=8.4.2",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.2,<0.11.0"]
+build-backend = "uv_build"
