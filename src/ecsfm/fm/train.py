@@ -1,9 +1,19 @@
 import os
+import multiprocessing
 import json
+
+cores = str(multiprocessing.cpu_count())
+os.environ["XLA_FLAGS"] = f"--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads={cores}"
+os.environ["OMP_NUM_THREADS"] = cores
+
 import jax
+from jax import config
+config.update("jax_enable_x64", False)
 import jax.numpy as jnp
 import equinox as eqx
 import optax
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import argparse
@@ -81,12 +91,13 @@ def compute_loss(model, x1, x0, key):
 def compute_val_loss(model, x1, x0, key):
     return flow_matching_loss(model, x1, x0, key)
 
-def save_comparison(model, epoch, state_dim, key):
+def save_comparison(model, epoch, state_dim, key, data_mean=0.0, data_std=1.0):
     print(f"Generating surrogate comparison for epoch {epoch}...")
-    n_samples = 5
+    n_samples = 50
     sample_key, _ = jax.random.split(key)
     x0 = jax.random.normal(sample_key, (n_samples, state_dim))
     x_generated = integrate_flow(model, x0, n_steps=100)
+    x_generated = x_generated * data_std + data_mean
     
     gt_samples = []
     keys = jax.random.split(key, n_samples)
@@ -108,24 +119,40 @@ def save_comparison(model, epoch, state_dim, key):
     gt_samples = np.array(gt_samples)
     x_generated = np.array(x_generated)
     
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    axes[0].set_title(f"Surrogate Epoch {epoch}")
+    gen_mean, gen_std = x_generated.mean(axis=0), x_generated.std(axis=0)
+    gt_mean, gt_std = gt_samples.mean(axis=0), gt_samples.std(axis=0)
+    
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle(f"Surrogate Distribution Comparison - Epoch {epoch}", fontsize=16)
+    
+    axes[0].set_title(f"Generated Samples ({n_samples})\n(From base Gaussian noise)")
     axes[0].set_xlabel("Distance [cm] (Grid Index)")
     axes[0].set_ylabel("Concentration [mM]")
     for i in range(n_samples):
-        axes[0].plot(x_generated[i], alpha=0.8)
+        axes[0].plot(x_generated[i], color='royalblue', alpha=0.15)
         
-    axes[1].set_title("Ground Truth Simulator")
+    axes[1].set_title(f"Ground Truth Samples ({n_samples})\n(From Physical Simulator)")
     axes[1].set_xlabel("Distance [cm] (Grid Index)")
     for i in range(n_samples):
-        axes[1].plot(gt_samples[i], alpha=0.8)
+        axes[1].plot(gt_samples[i], color='crimson', alpha=0.15)
         
+    axes[2].set_title(f"Distribution Statistics Overlap\n(Mean \u00b1 1 Std Dev)")
+    axes[2].set_xlabel("Distance [cm] (Grid Index)")
+    x_axis = np.arange(state_dim)
+    axes[2].plot(gen_mean, color='royalblue', label='Generated Mean')
+    axes[2].fill_between(x_axis, gen_mean - gen_std, gen_mean + gen_std, color='royalblue', alpha=0.2)
+    
+    axes[2].plot(gt_mean, color='crimson', label='Ground Truth Mean', linestyle='--')
+    axes[2].fill_between(x_axis, gt_mean - gt_std, gt_mean + gt_std, color='crimson', alpha=0.2)
+    axes[2].legend()
+    
     plt.tight_layout()
     plt.savefig(f"surrogate_comparison_ep{epoch}.png")
     plt.close()
 
 def train_surrogate(config: FlowConfig):
-    key = jax.random.PRNGKey(config.seed)
+    import numpy as np
+    key = jax.random.PRNGKey(np.uint32(config.seed))
     key, subkey = jax.random.split(key)
     
     dataset_file = "dataset_cache.npy"
@@ -142,10 +169,21 @@ def train_surrogate(config: FlowConfig):
         dataset = generate_training_data(config.n_samples, subkey)
         jnp.save(dataset_file, dataset)
     
+    key, subkey = jax.random.split(key)
+    indices = jax.random.permutation(subkey, len(dataset))
+    dataset = dataset[indices]
+    
     state_dim = dataset.shape[1]
     val_size = max(1, int(len(dataset) * config.val_split))
     train_dataset = dataset[:-val_size]
     val_dataset = dataset[-val_size:]
+    
+    data_mean = jnp.mean(train_dataset, axis=0)
+    data_std = jnp.std(train_dataset, axis=0) + 1e-5
+    
+    train_dataset = (train_dataset - data_mean) / data_std
+    val_dataset = (val_dataset - data_mean) / data_std
+    
     print(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
     
     key, subkey = jax.random.split(key)
@@ -207,14 +245,14 @@ def train_surrogate(config: FlowConfig):
         avg_loss = epoch_loss / n_batches
         history['train'].append(float(avg_loss))
         
-        if epoch % 10 == 0 or epoch == config.epochs - 1:
+        if epoch % 1000 == 0 or epoch == config.epochs - 1:
             key, sample_key, step_key = jax.random.split(key, 3)
             val_x0 = jax.random.normal(sample_key, val_dataset.shape)
             val_loss = compute_val_loss(model, val_dataset, val_x0, step_key)
             history['val'].append((epoch, float(val_loss)))
             pbar.set_postfix({"Train Loss": f"{avg_loss:.5f}", "Val Loss": f"{val_loss:.5f}"})
             
-        if epoch > start_epoch and epoch % 100 == 0:
+        if epoch > start_epoch and epoch % 10000 == 0:
             eqx.tree_serialise_leaves(checkpoint_path, model)
             with open("training_history.json", "w") as f:
                 json.dump({'history': history, 'epoch': epoch}, f)
@@ -234,14 +272,32 @@ def train_surrogate(config: FlowConfig):
             plt.savefig("loss_curve.png")
             plt.close()
             
-            save_comparison(model, epoch, state_dim, subkey)
+            save_comparison(model, epoch, state_dim, subkey, data_mean, data_std)
             
+    avg_loss = history['train'][-1] if history.get('train') else 0.0
     print(f"Final Epoch | Loss: {avg_loss:.5f}")
     
     eqx.tree_serialise_leaves(checkpoint_path, model)
     with open("training_history.json", "w") as f:
         json.dump({'history': history, 'epoch': config.epochs}, f)
     print("Saved Flow Matching final model weights to surrogate_model.eqx")
+    
+    # Always plot and verify the surrogate at the very end of any run
+    if history.get('train'):
+        plt.figure()
+        plt.plot(range(len(history['train'])), history['train'], label='Train Loss')
+        if history.get('val'):
+            val_epochs, val_losses = zip(*history['val'])
+            plt.plot(val_epochs, val_losses, label='Val Loss', marker='o')
+        plt.title("Flow Matching Training Loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("OT-CFM Loss")
+        plt.yscale('log')
+        plt.legend()
+        plt.savefig("loss_curve.png")
+        plt.close()
+        
+    save_comparison(model, config.epochs, state_dim, subkey, data_mean, data_std)
 
 def load_config_with_cli_overrides() -> FlowConfig:
     parser = argparse.ArgumentParser(description="Train Flow Matching Surrogate")
