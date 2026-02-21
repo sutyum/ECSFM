@@ -260,8 +260,15 @@ def main():
     key, subkey = jax.random.split(key)
     results_scorecard["EIS_Sine"] = run_classical_eval("EIS_Sine", E_eis, t_eis, params_slow, model, norm, subkey)
     
+    # Generate a rigorous physics score out of 100 based on overall R-squared
+    # R2 = 1.0 means perfect prediction (100)
+    # R2 <= 0.0 means worse-than-mean baseline prediction (0)
+    avg_r2 = np.mean([res["current_r2"] for res in results_scorecard.values()])
+    final_score = max(0.0, min(100.0, avg_r2 * 100.0))
+    results_scorecard["Final_Score_Out_Of_100"] = round(float(final_score), 2)
+    
     print("\n" + "="*50)
-    print("FINAL EVALUATION SCORECARD")
+    print(f"FINAL EVALUATION SCORECARD (Global Score: {results_scorecard['Final_Score_Out_Of_100']}/100)")
     print("="*50)
     print(json.dumps(results_scorecard, indent=4))
     
