@@ -37,6 +37,26 @@ def get_eis_waveform(E_dc, amplitude, frequency, t_total):
     E = E_dc + amplitude * np.sin(2 * np.pi * frequency * t)
     return E, t_total
 
+def get_swv_waveform(E_start, E_end, step_E, amplitude, freq):
+    t_step = 1.0 / freq
+    n_steps = int(abs(E_end - E_start) / step_E)
+    t_total = n_steps * t_step
+    
+    dt = 0.001
+    t = np.arange(0, t_total, dt)
+    
+    step_indices = (t / t_step).astype(int)
+    E_base = E_start + np.sign(E_end - E_start) * step_indices * step_E
+    
+    half_step = t_step / 2
+    is_forward = (t % t_step) < half_step
+    direction = np.sign(E_end - E_start)
+    if direction == 0: direction = 1
+    
+    E_pulse = np.where(is_forward, amplitude * direction, -amplitude * direction)
+    E = E_base + E_pulse
+    return E, t_total
+
 def _run_single_sim(args):
     E_arr, t_max, params, nx = args
     D_ox, D_red, C_ox, C_red, E0, k0, alpha = params
