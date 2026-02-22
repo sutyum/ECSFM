@@ -1,7 +1,10 @@
 import argparse
 import concurrent.futures
+from functools import partial
 import multiprocessing
 import os
+import re
+import sys
 from typing import Iterable
 
 import jax
@@ -32,6 +35,11 @@ BASE_STAGE_TASKS = {
     1: ["cv_multispecies", "swv_pulse", "kinetics_limited"],
     2: ["eis_low_freq", "eis_high_freq", "diffusion_limited"],
 }
+
+CHUNK_FILE_RE = re.compile(r"^chunk_(\d+)\.npz$")
+CHUNK_LOCK_RE = re.compile(r"^chunk_(\d+)\.lock$")
+GENERATION_BACKENDS = ("auto", "process_pool", "gpu_batch")
+PROGRESS_MODES = ("auto", "on", "off")
 
 
 def get_cv_waveform(E_start: float, E_vertex: float, scan_rate: float) -> tuple[np.ndarray, float]:
@@ -434,12 +442,269 @@ def _iter_sim_results(
             yield item
 
 
+def _resolve_generation_backend(backend: str) -> str:
+    if backend not in GENERATION_BACKENDS:
+        raise ValueError(f"backend must be one of {GENERATION_BACKENDS}, got {backend}")
+    if backend == "auto":
+        return "gpu_batch" if jax.default_backend().lower() in {"gpu", "tpu"} else "process_pool"
+    return backend
+
+
+def _resolve_progress_mode(progress: str) -> bool:
+    if progress not in PROGRESS_MODES:
+        raise ValueError(f"progress must be one of {PROGRESS_MODES}, got {progress}")
+    if progress == "on":
+        return True
+    if progress == "off":
+        return False
+
+    disable_env = os.environ.get("TQDM_DISABLE", "").strip().lower()
+    if disable_env not in {"", "0", "false", "no"}:
+        return False
+    return bool(sys.stderr.isatty())
+
+
+def _build_dense_matrix_from_r(r: jax.Array, nx: int, dtype: jnp.dtype) -> jax.Array:
+    main_diag = jnp.full((nx,), jnp.asarray(1.0, dtype=dtype) + jnp.asarray(2.0, dtype=dtype) * r, dtype=dtype)
+    upper_diag = jnp.full((nx - 1,), -r, dtype=dtype)
+    lower_diag = jnp.full((nx - 1,), -r, dtype=dtype)
+
+    main_diag = main_diag.at[0].set(jnp.asarray(1.0, dtype=dtype))
+    main_diag = main_diag.at[-1].set(jnp.asarray(1.0, dtype=dtype))
+    upper_diag = upper_diag.at[0].set(jnp.asarray(0.0, dtype=dtype))
+    lower_diag = lower_diag.at[-1].set(jnp.asarray(0.0, dtype=dtype))
+
+    return jnp.diag(main_diag) + jnp.diag(upper_diag, k=1) + jnp.diag(lower_diag, k=-1)
+
+
+@partial(jax.jit, static_argnames=("nx", "sim_steps"))
+def _simulate_batch_fixed_steps(
+    E_batch: jax.Array,
+    t_max_batch: jax.Array,
+    D_ox_batch: jax.Array,
+    D_red_batch: jax.Array,
+    C_ox_batch: jax.Array,
+    C_red_batch: jax.Array,
+    E0_batch: jax.Array,
+    k0_batch: jax.Array,
+    alpha_batch: jax.Array,
+    nx: int,
+    sim_steps: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    dtype = jnp.float32
+
+    E_batch = jnp.asarray(E_batch, dtype=dtype)
+    t_max_batch = jnp.asarray(t_max_batch, dtype=dtype)
+    D_ox_batch = jnp.asarray(D_ox_batch, dtype=dtype)
+    D_red_batch = jnp.asarray(D_red_batch, dtype=dtype)
+    C_ox_batch = jnp.asarray(C_ox_batch, dtype=dtype)
+    C_red_batch = jnp.asarray(C_red_batch, dtype=dtype)
+    E0_batch = jnp.asarray(E0_batch, dtype=dtype)
+    k0_batch = jnp.asarray(k0_batch, dtype=dtype)
+    alpha_batch = jnp.asarray(alpha_batch, dtype=dtype)
+
+    batch_size = E_batch.shape[0]
+    species_count = D_ox_batch.shape[1]
+    flat_size = batch_size * species_count
+
+    dx = jnp.asarray(0.05 / (nx - 1), dtype=dtype)
+    dt = t_max_batch / jnp.asarray(max(1, sim_steps - 1), dtype=dtype)
+    dt = jnp.maximum(dt, jnp.asarray(1e-6, dtype=dtype))
+    dt_species = dt[:, None]
+
+    to_mol_cm3 = jnp.asarray(1e-6, dtype=dtype)
+    to_mA = jnp.asarray(1000.0, dtype=dtype)
+    F = jnp.asarray(96485.3321, dtype=dtype)
+    f_constant = jnp.asarray(96485.3321 / (8.314462618 * 298.15), dtype=dtype)
+
+    r_ox = D_ox_batch * (dt_species / (dx**2))
+    r_red = D_red_batch * (dt_species / (dx**2))
+
+    vbuild = jax.vmap(jax.vmap(lambda r: _build_dense_matrix_from_r(r, nx=nx, dtype=dtype)))
+    M_ox = vbuild(r_ox)
+    M_red = vbuild(r_red)
+    vsolve = jax.vmap(jnp.linalg.solve, in_axes=(0, 0))
+
+    C_bulk_ox_mol = C_ox_batch * to_mol_cm3
+    C_bulk_red_mol = C_red_batch * to_mol_cm3
+
+    C_ox_init = jnp.broadcast_to(C_bulk_ox_mol[:, :, None], (batch_size, species_count, nx))
+    C_red_init = jnp.broadcast_to(C_bulk_red_mol[:, :, None], (batch_size, species_count, nx))
+
+    def step_fn(carry, i):
+        C_ox_state, C_red_state = carry
+        E_t = E_batch[:, i][:, None]
+
+        k_red = k0_batch * jnp.exp(-alpha_batch * f_constant * (E_t - E0_batch))
+        k_ox = k0_batch * jnp.exp((jnp.asarray(1.0, dtype=dtype) - alpha_batch) * f_constant * (E_t - E0_batch))
+
+        flux = k_ox * C_red_state[:, :, 0] - k_red * C_ox_state[:, :, 0]
+
+        max_ox_flux = (C_ox_state[:, :, 0] * dx) / dt_species
+        max_red_flux = (C_red_state[:, :, 0] * dx) / dt_species
+        flux = jnp.clip(flux, -max_ox_flux, max_red_flux)
+
+        rate_ox_0 = D_ox_batch * (C_ox_state[:, :, 1] - C_ox_state[:, :, 0]) / (dx**2) + flux / dx
+        rate_red_0 = D_red_batch * (C_red_state[:, :, 1] - C_red_state[:, :, 0]) / (dx**2) - flux / dx
+
+        C_ox_surf = C_ox_state[:, :, 0] + dt_species * rate_ox_0
+        C_red_surf = C_red_state[:, :, 0] + dt_species * rate_red_0
+
+        d_ox = C_ox_state.at[:, :, 0].set(C_ox_surf)
+        d_ox = d_ox.at[:, :, -1].set(C_bulk_ox_mol)
+        d_red = C_red_state.at[:, :, 0].set(C_red_surf)
+        d_red = d_red.at[:, :, -1].set(C_bulk_red_mol)
+
+        C_ox_next = vsolve(
+            M_ox.reshape((flat_size, nx, nx)),
+            d_ox.reshape((flat_size, nx)),
+        ).reshape((batch_size, species_count, nx))
+        C_red_next = vsolve(
+            M_red.reshape((flat_size, nx, nx)),
+            d_red.reshape((flat_size, nx)),
+        ).reshape((batch_size, species_count, nx))
+
+        C_ox_next = jax.nn.relu(C_ox_next)
+        C_red_next = jax.nn.relu(C_red_next)
+
+        I_species = F * flux * to_mA
+        I_t = jnp.sum(I_species, axis=1)
+
+        return (C_ox_next, C_red_next), I_t
+
+    (C_ox_final, C_red_final), I_f_hist = jax.lax.scan(
+        step_fn,
+        (C_ox_init, C_red_init),
+        jnp.arange(sim_steps, dtype=jnp.int32),
+    )
+
+    final_ox_flat = (C_ox_final * jnp.asarray(1e6, dtype=dtype)).reshape((batch_size, species_count * nx))
+    final_red_flat = (C_red_final * jnp.asarray(1e6, dtype=dtype)).reshape((batch_size, species_count * nx))
+    return final_ox_flat, final_red_flat, I_f_hist.T, E_batch
+
+
+@partial(jax.jit, static_argnames=("sim_steps",))
+def _apply_sensor_model_batch(
+    E_hist: jax.Array,
+    I_f_hist_mA: jax.Array,
+    t_max_batch: jax.Array,
+    sim_steps: int,
+    Cdl: float = 1e-5,
+    Ru: float = 100.0,
+) -> jax.Array:
+    dtype = jnp.float32
+
+    E_hist = jnp.asarray(E_hist, dtype=dtype)
+    I_f_hist_mA = jnp.asarray(I_f_hist_mA, dtype=dtype)
+    t_max_batch = jnp.asarray(t_max_batch, dtype=dtype)
+
+    dt = t_max_batch / jnp.asarray(max(1, sim_steps - 1), dtype=dtype)
+    dt = jnp.maximum(dt, jnp.asarray(1e-12, dtype=dtype))
+
+    cdl = jnp.asarray(Cdl, dtype=dtype)
+    ru = jnp.asarray(Ru, dtype=dtype)
+    tau = ru * cdl
+    half = jnp.asarray(0.5, dtype=dtype)
+    to_A = jnp.asarray(1000.0, dtype=dtype)
+    to_mA = jnp.asarray(1000.0, dtype=dtype)
+
+    I_f_hist_A = I_f_hist_mA / to_A
+
+    E0 = E_hist[:, 0]
+    I0 = I_f_hist_A[:, 0]
+    V_eff_0 = E0 - I0 * ru
+
+    def step_fn(carry, x):
+        E_real_prev, E_app_prev, I_f_prev = carry
+        E_app_curr, I_f_curr = x
+
+        V_eff_prev = E_app_prev - I_f_prev * ru
+        V_eff_curr = E_app_curr - I_f_curr * ru
+
+        term = tau / dt
+        E_real_curr = (E_real_prev * (term - half) + half * (V_eff_curr + V_eff_prev)) / (term + half)
+
+        dE_real = E_real_curr - E_real_prev
+        I_cap_A = cdl * dE_real / dt
+        I_total_A = I_cap_A + I_f_curr
+
+        return (E_real_curr, E_app_curr, I_f_curr), I_total_A
+
+    _, I_total_rest_A = jax.lax.scan(
+        step_fn,
+        (V_eff_0, E0, I0),
+        (E_hist[:, 1:].T, I_f_hist_A[:, 1:].T),
+    )
+    I_total_A = jnp.concatenate([I0[:, None], I_total_rest_A.T], axis=1)
+    return I_total_A * to_mA
+
+
+def _iter_sim_results_gpu_batch(
+    sim_args: list[tuple[np.ndarray, float, tuple[np.ndarray, ...], int]],
+    max_species: int,
+    nx: int,
+    sim_steps: int,
+    device_batch_size: int,
+) -> Iterable[tuple[np.ndarray, ...]]:
+    if sim_steps < 16:
+        raise ValueError(f"sim_steps must be >= 16 for gpu_batch, got {sim_steps}")
+    if device_batch_size <= 0:
+        raise ValueError(f"device_batch_size must be positive, got {device_batch_size}")
+
+    for start in range(0, len(sim_args), device_batch_size):
+        batch = sim_args[start : start + device_batch_size]
+        batch_size = len(batch)
+
+        E_batch = np.stack([_resample_trace(np.asarray(item[0], dtype=np.float32), sim_steps) for item in batch], axis=0)
+        t_max_batch = np.asarray([item[1] for item in batch], dtype=np.float32)
+
+        D_ox_batch = np.stack([np.asarray(item[2][0], dtype=np.float32) for item in batch], axis=0)
+        D_red_batch = np.stack([np.asarray(item[2][1], dtype=np.float32) for item in batch], axis=0)
+        C_ox_batch = np.stack([np.asarray(item[2][2], dtype=np.float32) for item in batch], axis=0)
+        C_red_batch = np.stack([np.asarray(item[2][3], dtype=np.float32) for item in batch], axis=0)
+        E0_batch = np.stack([np.asarray(item[2][4], dtype=np.float32) for item in batch], axis=0)
+        k0_batch = np.stack([np.asarray(item[2][5], dtype=np.float32) for item in batch], axis=0)
+        alpha_batch = np.stack([np.asarray(item[2][6], dtype=np.float32) for item in batch], axis=0)
+
+        final_ox_flat, final_red_flat, I_f_hist, E_hist = _simulate_batch_fixed_steps(
+            E_batch=jnp.asarray(E_batch),
+            t_max_batch=jnp.asarray(t_max_batch),
+            D_ox_batch=jnp.asarray(D_ox_batch),
+            D_red_batch=jnp.asarray(D_red_batch),
+            C_ox_batch=jnp.asarray(C_ox_batch),
+            C_red_batch=jnp.asarray(C_red_batch),
+            E0_batch=jnp.asarray(E0_batch),
+            k0_batch=jnp.asarray(k0_batch),
+            alpha_batch=jnp.asarray(alpha_batch),
+            nx=nx,
+            sim_steps=sim_steps,
+        )
+        I_total_hist = _apply_sensor_model_batch(
+            E_hist=E_hist,
+            I_f_hist_mA=I_f_hist,
+            t_max_batch=jnp.asarray(t_max_batch),
+            sim_steps=sim_steps,
+        )
+
+        ox_np = np.asarray(final_ox_flat, dtype=np.float32).reshape(batch_size, max_species, nx)
+        red_np = np.asarray(final_red_flat, dtype=np.float32).reshape(batch_size, max_species, nx)
+        curr_np = np.asarray(I_total_hist, dtype=np.float32)
+        signal_np = np.asarray(E_hist, dtype=np.float32)
+
+        for i in range(batch_size):
+            yield ox_np[i], red_np[i], curr_np[i], signal_np[i]
+
+
 def generate_multi_species_dataset(
     n_samples: int,
     key: jax.Array,
     max_species: int = 5,
     nx: int = 50,
     max_workers: int | None = None,
+    backend: str = "auto",
+    progress: bool = True,
+    sim_steps: int = 512,
+    device_batch_size: int = 128,
     recipe: str = "curriculum_multitask",
     stage_proportions: tuple[float, float, float] = (0.35, 0.35, 0.30),
     include_invariant_pairs: bool = True,
@@ -456,15 +721,26 @@ def generate_multi_species_dataset(
         raise ValueError(f"target_sig_len must be >= 20, got {target_sig_len}")
     if not (0.0 <= invariant_fraction <= 1.0):
         raise ValueError(f"invariant_fraction must be in [0, 1], got {invariant_fraction}")
+    if sim_steps < 16:
+        raise ValueError(f"sim_steps must be >= 16, got {sim_steps}")
+    if device_batch_size <= 0:
+        raise ValueError(f"device_batch_size must be positive, got {device_batch_size}")
 
-    if max_workers is None:
-        max_workers = max(1, multiprocessing.cpu_count() - 1)
-    max_workers = max(1, min(max_workers, n_samples))
+    resolved_backend = _resolve_generation_backend(backend)
+    if resolved_backend == "process_pool":
+        if max_workers is None:
+            max_workers = max(1, multiprocessing.cpu_count() - 1)
+        max_workers = max(1, min(max_workers, n_samples))
+    else:
+        max_workers = 1
 
     base_seed = int(jax.random.randint(key, shape=(), minval=0, maxval=2**31 - 1))
     rng = np.random.default_rng(base_seed)
 
-    print(f"Generating {n_samples} base simulations with recipe='{recipe}'...")
+    print(
+        f"Generating {n_samples} base simulations with recipe='{recipe}' "
+        f"(backend={resolved_backend})..."
+    )
 
     stage_ids = _sample_stage_ids(n_samples, recipe, stage_proportions, rng)
 
@@ -500,8 +776,26 @@ def generate_multi_species_dataset(
     stage_out: list[int] = []
     aug_ids: list[int] = []
 
-    iterator = _iter_sim_results(sim_args, max_workers=max_workers)
-    for i, (c_ox, c_red, i_hist, signal) in enumerate(tqdm(iterator, total=n_samples, desc="Simulating trajectories")):
+    if resolved_backend == "gpu_batch":
+        iterator = _iter_sim_results_gpu_batch(
+            sim_args=sim_args,
+            max_species=max_species,
+            nx=nx,
+            sim_steps=sim_steps,
+            device_batch_size=device_batch_size,
+        )
+    else:
+        iterator = _iter_sim_results(sim_args, max_workers=max_workers)
+
+    for i, (c_ox, c_red, i_hist, signal) in enumerate(
+        tqdm(
+            iterator,
+            total=n_samples,
+            desc="Simulating trajectories",
+            disable=not progress,
+            dynamic_ncols=True,
+        )
+    ):
         spec = sample_specs[i]
 
         c_ox_flat = c_ox.flatten()
@@ -576,14 +870,78 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-species", type=int, default=5, help="Maximum species represented in each sample")
     parser.add_argument("--nx", type=int, default=50, help="Spatial grid size")
     parser.add_argument("--workers", type=int, default=None, help="Process workers (default: cpu_count-1)")
+    parser.add_argument(
+        "--backend",
+        choices=GENERATION_BACKENDS,
+        default="auto",
+        help="Generation backend: auto selects gpu_batch on GPU/TPU and process_pool on CPU",
+    )
+    parser.add_argument(
+        "--progress",
+        choices=PROGRESS_MODES,
+        default="auto",
+        help="Progress bar display mode",
+    )
+    parser.add_argument(
+        "--sim-steps",
+        type=int,
+        default=512,
+        help="Fixed simulation steps used by gpu_batch backend",
+    )
+    parser.add_argument(
+        "--device-batch-size",
+        type=int,
+        default=128,
+        help="Per-launch batch size for gpu_batch backend",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Base random seed")
     parser.add_argument("--recipe", choices=["baseline_random", "curriculum_multitask", "stress_mixture"], default="curriculum_multitask", help="Dataset generation recipe")
     parser.add_argument("--stage-proportions", type=str, default="0.35,0.35,0.30", help="Foundation,bridge,frontier proportions for curriculum recipe")
     parser.add_argument("--target-sig-len", type=int, default=200, help="Resampled length for current and waveform signals")
     parser.add_argument("--invariant-fraction", type=float, default=0.35, help="Probability of adding invariant-augmentation pair per base sample")
     parser.add_argument("--no-invariants", action="store_true", help="Disable invariant pair augmentation")
+    parser.add_argument(
+        "--start-chunk",
+        type=int,
+        default=None,
+        help="Starting chunk index. If omitted, generation appends after existing chunk_*.npz files.",
+    )
     parser.add_argument("--output-dir", type=str, default="/tmp/ecsfm/dataset_massive", help="Output directory")
     return parser.parse_args()
+
+
+def infer_next_chunk_index(output_dir: str) -> int:
+    if not os.path.isdir(output_dir):
+        return 0
+
+    max_idx = -1
+    for name in os.listdir(output_dir):
+        match = CHUNK_FILE_RE.match(name) or CHUNK_LOCK_RE.match(name)
+        if match:
+            max_idx = max(max_idx, int(match.group(1)))
+    return max_idx + 1
+
+
+def reserve_chunk_lock(output_dir: str, start_idx: int) -> tuple[int, str]:
+    """Atomically reserve the next available chunk index using lock files."""
+    if start_idx < 0:
+        raise ValueError(f"start_idx must be >= 0, got {start_idx}")
+
+    chunk_idx = start_idx
+    while True:
+        chunk_path = os.path.join(output_dir, f"chunk_{chunk_idx}.npz")
+        if os.path.exists(chunk_path):
+            chunk_idx += 1
+            continue
+
+        lock_path = os.path.join(output_dir, f"chunk_{chunk_idx}.lock")
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
+                lock_file.write(f"pid={os.getpid()}\n")
+            return chunk_idx, lock_path
+        except FileExistsError:
+            chunk_idx += 1
 
 
 def main() -> None:
@@ -592,41 +950,78 @@ def main() -> None:
         raise ValueError(f"n_chunks must be positive, got {args.n_chunks}")
 
     stage_proportions = parse_stage_proportions(args.stage_proportions)
+    show_progress = _resolve_progress_mode(args.progress)
 
     os.makedirs(args.output_dir, exist_ok=True)
+    start_chunk = args.start_chunk if args.start_chunk is not None else infer_next_chunk_index(args.output_dir)
+    if start_chunk < 0:
+        raise ValueError(f"start_chunk must be >= 0, got {start_chunk}")
+    if args.start_chunk is None and start_chunk > 0:
+        print(f"Appending to existing dataset; starting from chunk index {start_chunk}.")
 
-    for chunk in range(args.n_chunks):
-        key = jax.random.PRNGKey(args.seed + chunk)
-        print(f"\n--- Generating chunk {chunk + 1}/{args.n_chunks} ---")
-        c_ox, c_red, curr, sigs, params, task_id, stage_id, aug_id = generate_multi_species_dataset(
-            n_samples=args.n_samples,
-            key=key,
-            max_species=args.max_species,
-            nx=args.nx,
-            max_workers=args.workers,
-            recipe=args.recipe,
-            stage_proportions=stage_proportions,
-            include_invariant_pairs=not args.no_invariants,
-            invariant_fraction=args.invariant_fraction,
-            target_sig_len=args.target_sig_len,
-        )
+    next_candidate = start_chunk
+    for chunk_offset in range(args.n_chunks):
+        if args.start_chunk is None:
+            chunk_idx, lock_path = reserve_chunk_lock(args.output_dir, next_candidate)
+            next_candidate = chunk_idx + 1
+        else:
+            chunk_idx = start_chunk + chunk_offset
+            chunk_path = os.path.join(args.output_dir, f"chunk_{chunk_idx}.npz")
+            if os.path.exists(chunk_path):
+                raise RuntimeError(
+                    f"Chunk file already exists at {chunk_path}; refusing to overwrite. "
+                    "Set --start-chunk to a new index or omit it to append automatically."
+                )
+            lock_path = os.path.join(args.output_dir, f"chunk_{chunk_idx}.lock")
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
+                    lock_file.write(f"pid={os.getpid()}\n")
+            except FileExistsError as exc:
+                raise RuntimeError(
+                    f"Chunk lock already exists at {lock_path}. "
+                    "Another generation process may be active."
+                ) from exc
 
-        chunk_path = os.path.join(args.output_dir, f"chunk_{chunk}.npz")
-        np.savez(
-            chunk_path,
-            ox=np.asarray(c_ox),
-            red=np.asarray(c_red),
-            i=np.asarray(curr),
-            e=np.asarray(sigs),
-            p=np.asarray(params),
-            task_id=np.asarray(task_id),
-            stage_id=np.asarray(stage_id),
-            aug_id=np.asarray(aug_id),
-            task_names=np.asarray(TASK_NAMES),
-            stage_names=np.asarray(STAGE_NAMES),
-            augmentation_names=np.asarray(AUGMENTATION_NAMES),
-        )
-        print(f"Saved chunk {chunk} to {chunk_path} ({len(c_ox)} total rows including augmentations)")
+        chunk_path = os.path.join(args.output_dir, f"chunk_{chunk_idx}.npz")
+        key = jax.random.PRNGKey(args.seed + chunk_idx)
+        print(f"\n--- Generating chunk {chunk_offset + 1}/{args.n_chunks} (chunk_{chunk_idx}) ---")
+        try:
+            c_ox, c_red, curr, sigs, params, task_id, stage_id, aug_id = generate_multi_species_dataset(
+                n_samples=args.n_samples,
+                key=key,
+                max_species=args.max_species,
+                nx=args.nx,
+                max_workers=args.workers,
+                backend=args.backend,
+                progress=show_progress,
+                sim_steps=args.sim_steps,
+                device_batch_size=args.device_batch_size,
+                recipe=args.recipe,
+                stage_proportions=stage_proportions,
+                include_invariant_pairs=not args.no_invariants,
+                invariant_fraction=args.invariant_fraction,
+                target_sig_len=args.target_sig_len,
+            )
+
+            np.savez(
+                chunk_path,
+                ox=np.asarray(c_ox),
+                red=np.asarray(c_red),
+                i=np.asarray(curr),
+                e=np.asarray(sigs),
+                p=np.asarray(params),
+                task_id=np.asarray(task_id),
+                stage_id=np.asarray(stage_id),
+                aug_id=np.asarray(aug_id),
+                task_names=np.asarray(TASK_NAMES),
+                stage_names=np.asarray(STAGE_NAMES),
+                augmentation_names=np.asarray(AUGMENTATION_NAMES),
+            )
+            print(f"Saved chunk {chunk_idx} to {chunk_path} ({len(c_ox)} total rows including augmentations)")
+        finally:
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
 
     print("\nDataset generation complete.")
 

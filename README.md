@@ -18,6 +18,9 @@ uv run python src/ecsfm/data/generate.py \
   --n-samples 1000 \
   --n-chunks 1 \
   --max-species 5 \
+  --backend auto \
+  --sim-steps 512 \
+  --device-batch-size 128 \
   --recipe curriculum_multitask \
   --output-dir /tmp/ecsfm/dataset_massive
 ```
@@ -38,6 +41,10 @@ Useful generation flags:
 - `--stage-proportions foundation,bridge,frontier` (curriculum recipe)
 - `--invariant-fraction 0.35` to add invariant pair augmentations
 - `--no-invariants` to disable augmentation pairs
+- `--backend {auto,process_pool,gpu_batch}` (`auto` uses `gpu_batch` on GPU/TPU)
+- `--sim-steps 512` controls fixed integration steps in `gpu_batch`
+- `--device-batch-size 128` controls GPU kernel batch size per launch
+- `--progress {auto,on,off}` controls tqdm display; use `off` for clean parallel logs
 
 ### 2) Train Surrogate
 
@@ -116,6 +123,146 @@ uv run python scripts/run_experimental_scenarios.py \
 This runs three scenarios (baseline, curriculum, curriculum+invariants) and writes:
 - `/tmp/ecsfm/experiments/scenario_summary.json`
 - `/tmp/ecsfm/experiments/scenario_report.md`
+
+### 7) Scale Out On Modal (GPU)
+
+Install dependencies and authenticate once:
+
+```bash
+uv sync
+uv run modal setup
+```
+
+Sanity check GPU runtime:
+
+```bash
+uv run modal run scripts/modal_pipeline.py::check_gpu
+```
+
+Generate chunks in parallel on Modal (GPU-backed workers):
+
+```bash
+uv run modal run scripts/modal_pipeline.py::generate_dataset \
+  --dataset-name dataset_balanced_742k \
+  --n-chunks 4 \
+  --parallelism 4 \
+  --n-samples-per-chunk 25000 \
+  --max-species 5 \
+  --nx 24 \
+  --workers 1 \
+  --seed 2026 \
+  --recipe curriculum_multitask \
+  --invariant-fraction 0.35
+```
+
+Train on Modal GPU and run evaluation:
+
+```bash
+uv run modal run scripts/modal_pipeline.py::train_model \
+  --dataset-name dataset_balanced_742k \
+  --artifact-name fullscale_balanced_modal \
+  --epochs 18 \
+  --batch-size 16 \
+  --n-samples 0 \
+  --lr 1e-3 \
+  --hidden-size 128 \
+  --depth 3
+```
+
+One command for generation + training + evaluation:
+
+```bash
+uv run modal run scripts/modal_pipeline.py::full_pipeline \
+  --dataset-name dataset_balanced_742k \
+  --artifact-name fullscale_balanced_modal \
+  --n-chunks 4 \
+  --parallelism 4 \
+  --n-samples-per-chunk 25000 \
+  --epochs 18 \
+  --batch-size 16
+```
+
+Exact absolute-path variants on this machine:
+
+```bash
+uv run modal run /Users/satyamtiwary/Documents/Hardware-Things/ElectrochemicalSensingFM/scripts/modal_pipeline.py::generate_dataset \
+  --dataset-name dataset_balanced_742k \
+  --n-chunks 4 \
+  --parallelism 4 \
+  --n-samples-per-chunk 25000 \
+  --max-species 5 \
+  --nx 24 \
+  --workers 1 \
+  --seed 2026 \
+  --recipe curriculum_multitask \
+  --invariant-fraction 0.35
+
+uv run modal run /Users/satyamtiwary/Documents/Hardware-Things/ElectrochemicalSensingFM/scripts/modal_pipeline.py::train_model \
+  --dataset-name dataset_balanced_742k \
+  --artifact-name fullscale_balanced_modal \
+  --epochs 18 \
+  --batch-size 16 \
+  --n-samples 0 \
+  --lr 1e-3 \
+  --hidden-size 128 \
+  --depth 3
+
+uv run modal run /Users/satyamtiwary/Documents/Hardware-Things/ElectrochemicalSensingFM/scripts/modal_pipeline.py::full_pipeline \
+  --dataset-name dataset_balanced_742k \
+  --artifact-name fullscale_balanced_modal \
+  --n-chunks 4 \
+  --parallelism 4 \
+  --n-samples-per-chunk 25000 \
+  --epochs 18 \
+  --batch-size 16
+```
+
+Modal volumes used by this workflow:
+- datasets: `ecsfm-datasets` mounted at `/vol/datasets`
+- artifacts: `ecsfm-artifacts` mounted at `/vol/artifacts`
+
+### 8) Visual Dataset Inspector
+
+Run local sanity summary + random sample gallery:
+
+```bash
+uv run python -m ecsfm.data.inspect \
+  --dataset /tmp/ecsfm/dataset_massive \
+  --output-dir /tmp/ecsfm/inspect \
+  --n-random 64 \
+  --n-gallery 12
+```
+
+Open an interactive browser over the selected random rows:
+
+```bash
+uv run python -m ecsfm.data.inspect \
+  --dataset /tmp/ecsfm/dataset_massive \
+  --output-dir /tmp/ecsfm/inspect \
+  --n-random 64 \
+  --show
+```
+
+Interactive controls:
+- `n`/right: next sample
+- `p`/left: previous sample
+- `r`/space: jump to random sample
+- `q`: close
+
+Inspector artifacts:
+- `sanity_report.json`: aggregate diagnostics and label distributions
+- `sanity_summary.png`: distribution and sanity-flag charts
+- `random_samples.pdf`: per-sample visual pages for quick review
+
+Inspect a dataset stored in Modal volume:
+
+```bash
+uv run modal run scripts/modal_pipeline.py::inspect_dataset \
+  --dataset-name dataset_balanced_742k \
+  --report-name dataset_balanced_742k_inspection \
+  --n-random 96 \
+  --n-gallery 24
+```
 
 ## Interactive CV Playground
 
