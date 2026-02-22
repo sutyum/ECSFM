@@ -1,4 +1,4 @@
-# ElectrochemicalSensingFM
+# ECSFM
 
 Physics-driven electrochemical simulation and conditional flow-matching surrogate training.
 
