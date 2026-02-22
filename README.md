@@ -264,6 +264,27 @@ uv run modal run scripts/modal_pipeline.py::inspect_dataset \
   --n-gallery 24
 ```
 
+### 9) Canonical Electrochem Benchmarks
+
+Run the expert-style benchmark test battery:
+
+```bash
+uv run pytest -q tests/test_echem_benchmarks.py
+```
+
+Generate a benchmark report with plots:
+
+```bash
+uv run python scripts/report_echem_benchmarks.py \
+  --output-dir /tmp/ecsfm/echem_benchmarks
+```
+
+Artifacts:
+- `/tmp/ecsfm/echem_benchmarks/benchmark_summary.json`
+- `/tmp/ecsfm/echem_benchmarks/benchmark_report.md`
+- `/tmp/ecsfm/echem_benchmarks/canonical_cv_cottrell.png`
+- `/tmp/ecsfm/echem_benchmarks/sensor_bode.png`
+
 ## Interactive CV Playground
 
 ```bash
