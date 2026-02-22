@@ -3,6 +3,7 @@ import glob
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import equinox as eqx
 import jax
@@ -19,17 +20,26 @@ from ecsfm.fm.objective import flow_matching_loss
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+NORMALIZERS_FILENAME = "normalizers.npz"
+MODEL_META_FILENAME = "model_meta.json"
+OPTIONAL_DATASET_KEYS = {
+    "task_id": 0,
+    "stage_id": 0,
+    "aug_id": 0,
+}
+
 
 class FlowConfig(BaseModel):
-    n_samples: int = Field(0, description="Number of trajectories to use (0 means all)")
-    epochs: int = Field(500, description="Number of training epochs")
-    batch_size: int = Field(32, description="Batch size")
-    lr: float = Field(1e-3, description="Learning rate")
-    hidden_size: int = Field(128, description="Hidden size for VectorFieldNet")
-    depth: int = Field(3, description="Depth for VectorFieldNet")
-    seed: int = Field(42, description="Random seed")
+    n_samples: int = Field(0, ge=0, description="Number of trajectories to use (0 means all)")
+    epochs: int = Field(500, ge=1, description="Number of training epochs")
+    batch_size: int = Field(32, ge=1, description="Batch size")
+    lr: float = Field(1e-3, gt=0.0, description="Learning rate")
+    hidden_size: int = Field(128, ge=1, description="Hidden size for VectorFieldNet")
+    depth: int = Field(3, ge=1, description="Depth for VectorFieldNet")
+    seed: int = Field(42, ge=0, description="Random seed")
     new_run: bool = Field(False, description="Start training from scratch, ignoring checkpoints")
-    val_split: float = Field(0.2, description="Fraction of dataset to use for validation")
+    val_split: float = Field(0.2, gt=0.0, lt=1.0, description="Fraction of dataset to use for validation")
+    curriculum: bool = Field(True, description="Enable curriculum stage-based sampling when stage labels exist")
 
 
 def integrate_flow(model: VectorFieldNet, x0: jax.Array, E: jax.Array, p: jax.Array, n_steps: int = 100) -> jax.Array:
@@ -59,44 +69,120 @@ def compute_val_loss(model, x1, x0, E, p, key):
     return flow_matching_loss(model, x1, x0, E, p, key)
 
 
-def load_dataset(data_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _extract_optional_arrays(data: np.lib.npyio.NpzFile, n_rows: int) -> tuple[dict[str, np.ndarray], dict[str, bool], dict[str, list[str]]]:
+    optional_arrays: dict[str, np.ndarray] = {}
+    optional_present: dict[str, bool] = {}
+
+    for key, default in OPTIONAL_DATASET_KEYS.items():
+        if key in data:
+            arr = np.asarray(data[key]).reshape(-1)
+            if arr.shape[0] != n_rows:
+                raise ValueError(
+                    f"Optional key '{key}' has length {arr.shape[0]} but expected {n_rows}"
+                )
+            optional_arrays[key] = arr.astype(np.int32)
+            optional_present[key] = True
+        else:
+            optional_arrays[key] = np.full((n_rows,), default, dtype=np.int32)
+            optional_present[key] = False
+
+    def _to_name_list(values: np.ndarray) -> list[str]:
+        names: list[str] = []
+        for value in np.asarray(values).tolist():
+            if isinstance(value, (bytes, np.bytes_)):
+                names.append(value.decode("utf-8"))
+            else:
+                names.append(str(value))
+        return names
+
+    label_names: dict[str, list[str]] = {}
+    for key in ("task_names", "stage_names", "augmentation_names"):
+        if key in data:
+            label_names[key] = _to_name_list(np.asarray(data[key]))
+
+    return optional_arrays, optional_present, label_names
+
+
+def load_dataset(
+    data_path: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     if os.path.isdir(data_path):
         chunk_files = sorted(glob.glob(os.path.join(data_path, "*.npz")))
         if not chunk_files:
             raise FileNotFoundError(f"No .npz chunks found in {data_path}")
 
         all_ox, all_red, all_i, all_e, all_p = [], [], [], [], []
+        optional_lists: dict[str, list[np.ndarray]] = {k: [] for k in OPTIONAL_DATASET_KEYS}
+        optional_seen: dict[str, bool] = {k: False for k in OPTIONAL_DATASET_KEYS}
+        label_names: dict[str, list[str]] = {}
+
         for chunk_file in tqdm(chunk_files, desc="Aggregating chunks"):
             data = np.load(chunk_file)
-            all_ox.append(data["ox"])
-            all_red.append(data["red"])
-            all_i.append(data["i"])
-            all_e.append(data["e"])
-            all_p.append(data["p"])
+            c_ox = np.asarray(data["ox"])
+            c_red = np.asarray(data["red"])
+            curr = np.asarray(data["i"])
+            sigs = np.asarray(data["e"])
+            params = np.asarray(data["p"])
+
+            if c_ox.ndim != 2 or c_red.ndim != 2 or curr.ndim != 2 or sigs.ndim != 2 or params.ndim != 2:
+                raise ValueError(f"Chunk {chunk_file} contains non-2D arrays")
+
+            n_rows = c_ox.shape[0]
+            if not (c_red.shape[0] == n_rows == curr.shape[0] == sigs.shape[0] == params.shape[0]):
+                raise ValueError(f"Chunk {chunk_file} has inconsistent row counts")
+
+            opt_arr, opt_present, names = _extract_optional_arrays(data, n_rows)
+            for key in OPTIONAL_DATASET_KEYS:
+                optional_lists[key].append(opt_arr[key])
+                optional_seen[key] = optional_seen[key] or opt_present[key]
+
+            for key, value in names.items():
+                if key not in label_names:
+                    label_names[key] = value
+
+            all_ox.append(c_ox)
+            all_red.append(c_red)
+            all_i.append(curr)
+            all_e.append(sigs)
+            all_p.append(params)
 
         c_ox = np.concatenate(all_ox, axis=0)
         c_red = np.concatenate(all_red, axis=0)
         curr = np.concatenate(all_i, axis=0)
         sigs = np.concatenate(all_e, axis=0)
         params = np.concatenate(all_p, axis=0)
+
+        extras: dict[str, Any] = {
+            key: (np.concatenate(optional_lists[key], axis=0) if optional_seen[key] else None)
+            for key in OPTIONAL_DATASET_KEYS
+        }
+        extras.update(label_names)
     else:
         if not os.path.exists(data_path):
             raise FileNotFoundError(f"Dataset not found at {data_path}")
+
         data = np.load(data_path)
-        c_ox = data["ox"]
-        c_red = data["red"]
-        curr = data["i"]
-        sigs = data["e"]
-        params = data["p"]
+        c_ox = np.asarray(data["ox"])
+        c_red = np.asarray(data["red"])
+        curr = np.asarray(data["i"])
+        sigs = np.asarray(data["e"])
+        params = np.asarray(data["p"])
 
-    if c_ox.ndim != 2 or c_red.ndim != 2 or curr.ndim != 2 or sigs.ndim != 2 or params.ndim != 2:
-        raise ValueError("Expected all dataset arrays to be 2D.")
+        if c_ox.ndim != 2 or c_red.ndim != 2 or curr.ndim != 2 or sigs.ndim != 2 or params.ndim != 2:
+            raise ValueError("Expected all dataset arrays to be 2D.")
 
-    n = c_ox.shape[0]
-    if not (c_red.shape[0] == n == curr.shape[0] == sigs.shape[0] == params.shape[0]):
-        raise ValueError("Dataset arrays must have the same number of rows (samples).")
+        n_rows = c_ox.shape[0]
+        if not (c_red.shape[0] == n_rows == curr.shape[0] == sigs.shape[0] == params.shape[0]):
+            raise ValueError("Dataset arrays must have the same number of rows (samples).")
 
-    return c_ox, c_red, curr, sigs, params
+        opt_arr, opt_present, names = _extract_optional_arrays(data, n_rows)
+        extras = {
+            key: (opt_arr[key] if opt_present[key] else None)
+            for key in OPTIONAL_DATASET_KEYS
+        }
+        extras.update(names)
+
+    return c_ox, c_red, curr, sigs, params, extras
 
 
 def infer_geometry(
@@ -126,6 +212,53 @@ def infer_geometry(
     target_len = curr.shape[1]
     state_dim = species_state_dim * 2 + target_len
     return max_species, nx, target_len, state_dim
+
+
+def save_normalizers(
+    path: Path,
+    x_mean: jax.Array,
+    x_std: jax.Array,
+    e_mean: jax.Array,
+    e_std: jax.Array,
+    p_mean: jax.Array,
+    p_std: jax.Array,
+) -> None:
+    np.savez(
+        path,
+        x_mean=np.asarray(x_mean),
+        x_std=np.asarray(x_std),
+        e_mean=np.asarray(e_mean),
+        e_std=np.asarray(e_std),
+        p_mean=np.asarray(p_mean),
+        p_std=np.asarray(p_std),
+    )
+
+
+def load_saved_normalizers(normalizers_path: str | Path) -> tuple[jax.Array, ...]:
+    normalizers_path = Path(normalizers_path)
+    if not normalizers_path.exists():
+        raise FileNotFoundError(f"Normalizer file not found at {normalizers_path}")
+
+    data = np.load(normalizers_path)
+    required = ("x_mean", "x_std", "e_mean", "e_std", "p_mean", "p_std")
+    missing = [k for k in required if k not in data]
+    if missing:
+        raise ValueError(f"Normalizer file missing keys: {missing}")
+
+    return tuple(jnp.asarray(data[k]) for k in required)
+
+
+def save_model_metadata(meta_path: Path, metadata: dict[str, Any]) -> None:
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+
+def load_model_metadata(meta_path: str | Path) -> dict[str, Any]:
+    meta_path = Path(meta_path)
+    if not meta_path.exists():
+        raise FileNotFoundError(f"Model metadata not found at {meta_path}")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def save_loss_curve(history: dict[str, list], output_path: Path) -> None:
@@ -160,6 +293,7 @@ def save_comparison(
     target_len: int,
     output_path: Path,
 ) -> None:
+    del target_len
     if val_x.shape[0] == 0:
         return
 
@@ -214,25 +348,42 @@ def save_comparison(
     plt.close()
 
 
-def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> None:
-    if config.epochs <= 0:
-        raise ValueError(f"epochs must be positive, got {config.epochs}")
-    if config.batch_size <= 0:
-        raise ValueError(f"batch_size must be positive, got {config.batch_size}")
-    if config.lr <= 0:
-        raise ValueError(f"lr must be positive, got {config.lr}")
-    if not (0.0 < config.val_split < 1.0):
-        raise ValueError(f"val_split must be in (0, 1), got {config.val_split}")
+def _build_task_stage_features(
+    task_id: np.ndarray,
+    stage_id: np.ndarray,
+    n_tasks_hint: int | None = None,
+    n_stages_hint: int | None = None,
+) -> tuple[np.ndarray, int, int]:
+    n_tasks = max(1, int(np.max(task_id)) + 1)
+    n_stages = max(1, int(np.max(stage_id)) + 1)
+    if n_tasks_hint is not None:
+        n_tasks = max(n_tasks, int(n_tasks_hint))
+    if n_stages_hint is not None:
+        n_stages = max(n_stages, int(n_stages_hint))
 
+    task_oh = np.eye(n_tasks, dtype=np.float32)[task_id]
+    stage_oh = np.eye(n_stages, dtype=np.float32)[stage_id]
+    return np.concatenate([task_oh, stage_oh], axis=1), n_tasks, n_stages
+
+
+def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> None:
     artifact_path = Path(artifact_dir)
     artifact_path.mkdir(parents=True, exist_ok=True)
+
     checkpoint_path = artifact_path / "surrogate_model.eqx"
     history_path = artifact_path / "training_history.json"
     loss_curve_path = artifact_path / "loss_curve.png"
+    normalizers_path = artifact_path / NORMALIZERS_FILENAME
+    model_meta_path = artifact_path / MODEL_META_FILENAME
 
     key = jax.random.PRNGKey(np.uint32(config.seed))
 
-    c_ox, c_red, curr, sigs, params = load_dataset(data_path)
+    c_ox, c_red, curr, sigs, params_base, extras = load_dataset(data_path)
+    task_id = extras.get("task_id")
+    stage_id = extras.get("stage_id")
+    task_names_raw = extras.get("task_names")
+    stage_names_raw = extras.get("stage_names")
+    has_task_stage_labels = (task_id is not None) or (stage_id is not None)
 
     if config.n_samples > 0:
         n_keep = min(config.n_samples, c_ox.shape[0])
@@ -240,20 +391,49 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
         c_red = c_red[:n_keep]
         curr = curr[:n_keep]
         sigs = sigs[:n_keep]
-        params = params[:n_keep]
+        params_base = params_base[:n_keep]
+        if task_id is not None:
+            task_id = task_id[:n_keep]
+        if stage_id is not None:
+            stage_id = stage_id[:n_keep]
 
     if c_ox.shape[0] < 2:
         raise ValueError(
             f"Need at least 2 trajectories after filtering to train+validate, got {c_ox.shape[0]}"
         )
 
-    max_species, nx, target_len, state_dim = infer_geometry(c_ox, c_red, curr, params)
+    max_species, nx, target_len, state_dim = infer_geometry(c_ox, c_red, curr, params_base)
+
+    use_task_stage_features = has_task_stage_labels or task_names_raw is not None or stage_names_raw is not None
+    if use_task_stage_features:
+        if task_id is None:
+            task_id = np.zeros((c_ox.shape[0],), dtype=np.int32)
+        if stage_id is None:
+            stage_id = np.zeros((c_ox.shape[0],), dtype=np.int32)
+
+        n_tasks_hint = len(task_names_raw) if task_names_raw is not None else None
+        n_stages_hint = len(stage_names_raw) if stage_names_raw is not None else None
+        task_stage_features, n_tasks, n_stages = _build_task_stage_features(
+            task_id=task_id,
+            stage_id=stage_id,
+            n_tasks_hint=n_tasks_hint,
+            n_stages_hint=n_stages_hint,
+        )
+        params_cond = np.concatenate([params_base.astype(np.float32), task_stage_features], axis=1)
+    else:
+        n_tasks = 0
+        n_stages = 0
+        task_id = np.zeros((c_ox.shape[0],), dtype=np.int32)
+        stage_id = np.zeros((c_ox.shape[0],), dtype=np.int32)
+        params_cond = params_base.astype(np.float32)
 
     c_ox = jnp.asarray(c_ox)
     c_red = jnp.asarray(c_red)
     curr = jnp.asarray(curr)
     sigs = jnp.asarray(sigs)
-    params = jnp.asarray(params)
+    params_cond = jnp.asarray(params_cond)
+    task_id = jnp.asarray(task_id)
+    stage_id = jnp.asarray(stage_id)
 
     dataset_x = jnp.concatenate([c_ox, c_red, curr], axis=1)
 
@@ -261,7 +441,9 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
     indices = jax.random.permutation(subkey, len(dataset_x))
     dataset_x = dataset_x[indices]
     sigs = sigs[indices]
-    params = params[indices]
+    params_cond = params_cond[indices]
+    task_id = task_id[indices]
+    stage_id = stage_id[indices]
 
     total = int(len(dataset_x))
     val_size = int(total * config.val_split)
@@ -271,8 +453,9 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
     val_x = dataset_x[-val_size:]
     train_e = sigs[:-val_size]
     val_e = sigs[-val_size:]
-    train_p = params[:-val_size]
-    val_p = params[-val_size:]
+    train_p = params_cond[:-val_size]
+    val_p = params_cond[-val_size:]
+    train_stage = np.asarray(stage_id[:-val_size])
 
     x_mean = jnp.mean(train_x, axis=0)
     x_std = jnp.std(train_x, axis=0) + 1e-5
@@ -291,8 +474,58 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
     print(f"Train size: {len(train_x)}, Val size: {len(val_x)}")
     print(
         f"Model dimensions: state_dim={state_dim}, max_species={max_species}, "
-        f"nx={nx}, target_len={target_len}, phys_dim={params.shape[1]}"
+        f"nx={nx}, target_len={target_len}, phys_dim={params_cond.shape[1]}, "
+        f"tasks={n_tasks}, stages={n_stages}, curriculum={config.curriculum}"
     )
+
+    save_normalizers(
+        normalizers_path,
+        x_mean=x_mean,
+        x_std=x_std,
+        e_mean=e_mean,
+        e_std=e_std,
+        p_mean=p_mean,
+        p_std=p_std,
+    )
+
+    if n_tasks == 0:
+        task_names = []
+    elif task_names_raw is None:
+        task_names = [f"task_{i}" for i in range(n_tasks)]
+    else:
+        task_names = list(task_names_raw)[:n_tasks]
+        if len(task_names) < n_tasks:
+            task_names.extend(f"task_{i}" for i in range(len(task_names), n_tasks))
+
+    if n_stages == 0:
+        stage_names = []
+    elif stage_names_raw is None:
+        stage_names = [f"stage_{i}" for i in range(n_stages)]
+    else:
+        stage_names = list(stage_names_raw)[:n_stages]
+        if len(stage_names) < n_stages:
+            stage_names.extend(f"stage_{i}" for i in range(len(stage_names), n_stages))
+
+    model_meta = {
+        "state_dim": int(state_dim),
+        "max_species": int(max_species),
+        "nx": int(nx),
+        "target_len": int(target_len),
+        "phys_dim_base": int(params_base.shape[1]),
+        "phys_dim": int(params_cond.shape[1]),
+        "n_tasks": int(n_tasks),
+        "n_stages": int(n_stages),
+        "cond_dim": 32,
+        "hidden_size": int(config.hidden_size),
+        "depth": int(config.depth),
+        "seed": int(config.seed),
+        "val_split": float(config.val_split),
+        "curriculum_enabled": bool(config.curriculum),
+        "task_names": task_names,
+        "stage_names": stage_names,
+        "normalizers_file": NORMALIZERS_FILENAME,
+    }
+    save_model_metadata(model_meta_path, model_meta)
 
     key, subkey = jax.random.split(key)
     model = VectorFieldNet(
@@ -300,7 +533,7 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
         hidden_size=config.hidden_size,
         depth=config.depth,
         cond_dim=32,
-        phys_dim=params.shape[1],
+        phys_dim=params_cond.shape[1],
         key=subkey,
     )
 
@@ -331,17 +564,28 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
 
     pbar = tqdm(range(start_epoch, config.epochs), desc="Training")
     for epoch in pbar:
-        key, subkey = jax.random.split(key)
-        perms = jax.random.permutation(subkey, len(train_x))
+        if config.curriculum and n_stages > 1:
+            progress = epoch / max(1, config.epochs - 1)
+            allowed_stage = min(n_stages - 1, int(np.floor(progress * n_stages)))
+            eligible = np.where(train_stage <= allowed_stage)[0]
+            if eligible.size < config.batch_size:
+                eligible = np.arange(len(train_x))
+            key, subkey = jax.random.split(key)
+            perm_local = np.asarray(jax.random.permutation(subkey, eligible.size))
+            epoch_indices = eligible[perm_local]
+        else:
+            allowed_stage = n_stages - 1
+            key, subkey = jax.random.split(key)
+            epoch_indices = np.asarray(jax.random.permutation(subkey, len(train_x)))
 
-        shuffled_x1 = train_x[perms]
-        shuffled_e = train_e[perms]
-        shuffled_p = train_p[perms]
+        shuffled_x1 = train_x[epoch_indices]
+        shuffled_e = train_e[epoch_indices]
+        shuffled_p = train_p[epoch_indices]
 
         epoch_loss = 0.0
         n_batches = 0
 
-        for i in range(0, len(train_x), config.batch_size):
+        for i in range(0, len(shuffled_x1), config.batch_size):
             batch_x1 = shuffled_x1[i : i + config.batch_size]
             batch_e = shuffled_e[i : i + config.batch_size]
             batch_p = shuffled_p[i : i + config.batch_size]
@@ -364,7 +608,13 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
             val_x0 = jax.random.normal(sample_key, val_x.shape)
             val_loss = float(compute_val_loss(model, val_x, val_x0, val_e, val_p, step_key))
             history["val"].append((epoch, val_loss))
-            pbar.set_postfix({"train": f"{avg_loss:.5f}", "val": f"{val_loss:.5f}"})
+            pbar.set_postfix(
+                {
+                    "train": f"{avg_loss:.5f}",
+                    "val": f"{val_loss:.5f}",
+                    "stage<=": str(allowed_stage),
+                }
+            )
 
         if epoch > start_epoch and epoch % 10000 == 0:
             eqx.tree_serialise_leaves(checkpoint_path, model)
@@ -414,45 +664,87 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
 
     print(f"Saved model to {checkpoint_path}")
     print(f"Saved history to {history_path}")
+    print(f"Saved normalizers to {normalizers_path}")
+    print(f"Saved model metadata to {model_meta_path}")
 
 
-def parse_args() -> argparse.Namespace:
+def _load_config_defaults(config_path: str | None) -> dict[str, Any]:
+    if config_path is None:
+        return {}
+    with open(config_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError(f"Config file must contain a JSON object, got {type(raw)}")
+    return raw
+
+
+def _cfg(defaults: dict[str, Any], key: str, fallback: Any, aliases: tuple[str, ...] = ()) -> Any:
+    for candidate in (key, *aliases):
+        if candidate in defaults:
+            return defaults[candidate]
+    return fallback
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     base_parser = argparse.ArgumentParser(add_help=False)
     base_parser.add_argument("--config", type=str, default=None, help="Path to JSON config file")
-    base_args, _ = base_parser.parse_known_args()
+    base_args, _ = base_parser.parse_known_args(argv)
 
-    file_defaults = {}
-    if base_args.config is not None:
-        with open(base_args.config, "r", encoding="utf-8") as f:
-            file_defaults = json.load(f)
+    file_defaults = _load_config_defaults(base_args.config)
 
     parser = argparse.ArgumentParser(
         description="Train Flow Matching surrogate",
         parents=[base_parser],
     )
 
-    parser.set_defaults(**file_defaults)
-
     parser.add_argument(
         "--dataset",
         "--data-path",
         dest="data_path",
         type=str,
-        default="/tmp/ecsfm/dataset_massive",
+        default=_cfg(file_defaults, "data_path", "/tmp/ecsfm/dataset_massive", aliases=("dataset",)),
         help="Path to NPZ file or directory of NPZ chunks",
     )
-    parser.add_argument("--artifact-dir", type=str, default="/tmp/ecsfm", help="Output directory for model/artifacts")
-    parser.add_argument("--n-samples", type=int, default=0, help="Samples to use (0 = all)")
-    parser.add_argument("--epochs", type=int, default=500, help="Training epochs")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--hidden-size", type=int, default=128, help="MLP hidden size")
-    parser.add_argument("--depth", type=int, default=3, help="MLP depth")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--new-run", action="store_true", help="Ignore checkpoint and start from scratch")
-    parser.add_argument("--val-split", type=float, default=0.2, help="Validation fraction")
+    parser.add_argument(
+        "--artifact-dir",
+        type=str,
+        default=_cfg(file_defaults, "artifact_dir", "/tmp/ecsfm"),
+        help="Output directory for model/artifacts",
+    )
+    parser.add_argument("--n-samples", type=int, default=int(_cfg(file_defaults, "n_samples", 0)), help="Samples to use (0 = all)")
+    parser.add_argument("--epochs", type=int, default=int(_cfg(file_defaults, "epochs", 500)), help="Training epochs")
+    parser.add_argument("--batch-size", type=int, default=int(_cfg(file_defaults, "batch_size", 32)), help="Batch size")
+    parser.add_argument("--lr", type=float, default=float(_cfg(file_defaults, "lr", 1e-3)), help="Learning rate")
+    parser.add_argument("--hidden-size", type=int, default=int(_cfg(file_defaults, "hidden_size", 128)), help="MLP hidden size")
+    parser.add_argument("--depth", type=int, default=int(_cfg(file_defaults, "depth", 3)), help="MLP depth")
+    parser.add_argument("--seed", type=int, default=int(_cfg(file_defaults, "seed", 42)), help="Random seed")
+    parser.add_argument(
+        "--new-run",
+        action="store_true",
+        default=bool(_cfg(file_defaults, "new_run", False)),
+        help="Ignore checkpoint and start from scratch",
+    )
+    parser.add_argument(
+        "--resume",
+        dest="new_run",
+        action="store_false",
+        help="Resume from checkpoint if available (overrides config new_run=true)",
+    )
+    parser.add_argument(
+        "--curriculum",
+        action="store_true",
+        default=bool(_cfg(file_defaults, "curriculum", True)),
+        help="Enable curriculum stage-based sampling",
+    )
+    parser.add_argument(
+        "--no-curriculum",
+        dest="curriculum",
+        action="store_false",
+        help="Disable curriculum stage-based sampling",
+    )
+    parser.add_argument("--val-split", type=float, default=float(_cfg(file_defaults, "val_split", 0.2)), help="Validation fraction")
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -468,6 +760,7 @@ def main() -> None:
         seed=args.seed,
         new_run=args.new_run,
         val_split=args.val_split,
+        curriculum=args.curriculum,
     )
 
     train_surrogate(config=config, data_path=args.data_path, artifact_dir=args.artifact_dir)
