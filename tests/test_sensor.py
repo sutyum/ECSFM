@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 from ecsfm.sim.sensor import apply_sensor_model
 
 def test_sensor_cv_baseline():

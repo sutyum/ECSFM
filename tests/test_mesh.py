@@ -1,6 +1,8 @@
+# ruff: noqa: E402
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
+import pytest
 from ecsfm.sim.mesh import Mesh1D
 
 def test_mesh1d_initialization():
@@ -35,3 +37,11 @@ def test_mesh1d_laplacian():
     lap_cubic = mesh.laplacian(C_cubic)
     expected_lap = 6.0 * mesh.x
     assert jnp.allclose(lap_cubic[1:-1], expected_lap[1:-1], atol=1e-3)
+
+
+def test_mesh1d_invalid_configuration():
+    with pytest.raises(ValueError):
+        Mesh1D(x_min=0.0, x_max=1.0, n_points=1)
+
+    with pytest.raises(ValueError):
+        Mesh1D(x_min=1.0, x_max=1.0, n_points=10)

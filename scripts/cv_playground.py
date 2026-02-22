@@ -11,7 +11,7 @@ def build_dashboard(args):
     Runs the CV Simulation and builds the interactive Matplotlib Dashboard.
     """
     print(f"Running simulation with {args.scan_rate} V/s scan rate...")
-    x, C_ox, C_red, E_full, I_full, E_vis = simulate_cv(
+    x, C_ox, C_red, E_full, I_full, _ = simulate_cv(
         D_ox=args.d_ox,
         D_red=args.d_red,
         C_bulk_ox=args.c_ox,
@@ -56,7 +56,7 @@ def build_dashboard(args):
     ax2 = fig.add_subplot(gs[1], facecolor=bg_color)
     ax2.set_title("Cyclic Voltammogram", color=text_color, fontsize=14, pad=15)
     ax2.set_xlabel("Potential / V", color=text_color)
-    ax2.set_ylabel("Current Density / $mA \cdot cm^{-2}$", color=text_color)
+    ax2.set_ylabel(r"Current Density / $mA \cdot cm^{-2}$", color=text_color)
     ax2.tick_params(colors=text_color)
     for spine in ax2.spines.values():
         spine.set_color('#333333')
@@ -83,11 +83,14 @@ def build_dashboard(args):
     slider.valtext.set_color(text_color)
     
     # Scale index mapping from thin history to full history
-    scale_factor = len(E_full) / len(C_ox)
-    
+    if len(C_ox) > 1:
+        scale_factor = (len(E_full) - 1) / (len(C_ox) - 1)
+    else:
+        scale_factor = 1.0
+
     def update(val):
         idx = int(slider.val)
-        full_idx = int(idx * scale_factor)
+        full_idx = min(int(round(idx * scale_factor)), len(E_full) - 1)
         
         line_ox_plot.set_ydata(C_ox[idx])
         line_red_plot.set_ydata(C_red[idx])

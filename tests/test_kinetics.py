@@ -1,6 +1,4 @@
-import jax
 import jax.numpy as jnp
-import pytest
 from ecsfm.sim.kinetics import ButlerVolmer
 
 def test_butler_volmer_equilibrium():

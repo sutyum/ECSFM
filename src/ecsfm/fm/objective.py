@@ -1,6 +1,5 @@
 import jax
 import jax.numpy as jnp
-import equinox as eqx
 
 def flow_matching_loss(model, x1: jax.Array, x0: jax.Array, E: jax.Array, p: jax.Array, key: jax.random.PRNGKey):
     """

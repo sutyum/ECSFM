@@ -1,6 +1,5 @@
-import jax
-import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from ecsfm.sim.cv import simulate_cv
 
@@ -43,3 +42,29 @@ def test_simulate_cv_bounds():
     
     # Check that maximum current is not astronomically large (e.g. bounded below 10^5 mA/cm2)
     assert np.max(np.abs(I_hist)) < 100000, f"Current exploded to {np.max(np.abs(I_hist))} mA/cm2"
+
+
+def test_simulate_cv_rejects_invalid_scan_rate():
+    with pytest.raises(ValueError):
+        simulate_cv(scan_rate=0.0, nx=50)
+
+
+def test_simulate_cv_accepts_float32_inputs():
+    import jax.numpy as jnp
+
+    x, C_ox_hist, C_red_hist, E_hist, I_hist, E_hist_vis = simulate_cv(
+        D_ox=jnp.float32(1e-5),
+        D_red=jnp.float32(1e-5),
+        C_bulk_ox=jnp.float32(1.0),
+        C_bulk_red=jnp.float32(0.0),
+        E0=jnp.float32(0.0),
+        k0=jnp.float32(0.01),
+        alpha=jnp.float32(0.5),
+        scan_rate=jnp.float32(1.0),
+        nx=50,
+    )
+
+    assert x.shape[0] == 50
+    assert C_ox_hist.shape == C_red_hist.shape
+    assert E_hist.shape == I_hist.shape
+    assert E_hist_vis.shape[0] == C_ox_hist.shape[0]
