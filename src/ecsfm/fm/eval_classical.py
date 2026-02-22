@@ -22,6 +22,8 @@ from ecsfm.fm.model import VectorFieldNet
 from ecsfm.fm.train import (
     MODEL_META_FILENAME,
     NORMALIZERS_FILENAME,
+    _build_param_input,
+    _build_signal_input,
     integrate_flow,
     load_dataset,
     load_model_metadata,
@@ -250,6 +252,9 @@ def run_classical_eval(
     target_len: int,
     n_tasks: int,
     n_stages: int,
+    phys_dim_core: int,
+    param_mask_features: bool,
+    signal_channels: int,
     task_names: list[str],
     stage_names: list[str],
     output_dir: Path,
@@ -310,7 +315,7 @@ def run_classical_eval(
         default_index=max(0, n_stages - 1),
     )
 
-    full_params = _build_conditioning_vector(
+    full_params_core = _build_conditioning_vector(
         flat_base_params=flat_base_params,
         n_tasks=n_tasks,
         n_stages=n_stages,
@@ -318,14 +323,25 @@ def run_classical_eval(
         stage_idx=stage_idx,
     )
 
-    if full_params.shape[0] != int(p_mean.shape[0]):
+    if full_params_core.shape[0] != int(p_mean.shape[0]) or full_params_core.shape[0] != phys_dim_core:
         raise ValueError(
             "Conditioning dim mismatch during eval: "
-            f"constructed={full_params.shape[0]}, normalizer={int(p_mean.shape[0])}."
+            f"constructed={full_params_core.shape[0]}, expected_core={phys_dim_core}, "
+            f"normalizer={int(p_mean.shape[0])}."
         )
 
-    e_normalized = (jnp.array([e_signal]) - e_mean) / e_std
-    p_normalized = (jnp.array([full_params]) - p_mean) / p_std
+    e_normalized_base = (jnp.array([e_signal]) - e_mean) / e_std
+    p_normalized_core = (jnp.array([full_params_core]) - p_mean) / p_std
+    e_normalized = _build_signal_input(
+        signal_norm=e_normalized_base,
+        signal_mask=None,
+        signal_channels=signal_channels,
+    )
+    p_normalized = _build_param_input(
+        params_norm=p_normalized_core,
+        param_mask=None,
+        append_mask_features=param_mask_features,
+    )
 
     state_dim = int(x_mean.shape[0])
     x0 = jax.random.normal(key, (1, state_dim))
@@ -411,18 +427,24 @@ def _resolve_model_geometry(norm: tuple[jax.Array, ...], model_meta: dict[str, A
 
     state_dim = int(x_mean.shape[0])
     target_len = int(e_mean.shape[0])
-    phys_dim = int(p_mean.shape[0])
+    phys_norm_dim = int(p_mean.shape[0])
+    signal_channels = int(model_meta.get("signal_channels", 1)) if model_meta else 1
+    if signal_channels not in (1, 2):
+        raise ValueError(f"Unsupported signal_channels={signal_channels}; expected 1 or 2.")
 
     max_species = int(model_meta.get("max_species", 0)) if model_meta else 0
     phys_dim_base = int(model_meta.get("phys_dim_base", 0)) if model_meta else 0
+    phys_dim_core = int(model_meta.get("phys_dim_core", phys_norm_dim)) if model_meta else phys_norm_dim
+    param_mask_features = bool(model_meta.get("param_mask_features", False)) if model_meta else False
+    phys_dim = int(model_meta.get("phys_dim", phys_dim_core * (2 if param_mask_features else 1))) if model_meta else phys_dim_core
 
     if max_species <= 0:
         if phys_dim_base > 0:
             if phys_dim_base % 7 != 0:
                 raise ValueError(f"Invalid phys_dim_base={phys_dim_base}; expected divisibility by 7")
             max_species = phys_dim_base // 7
-        elif phys_dim % 7 == 0:
-            max_species = phys_dim // 7
+        elif phys_dim_core % 7 == 0:
+            max_species = phys_dim_core // 7
         else:
             raise ValueError(
                 "Unable to infer max_species from normalizers. "
@@ -436,12 +458,23 @@ def _resolve_model_geometry(norm: tuple[jax.Array, ...], model_meta: dict[str, A
         raise ValueError(
             f"Inconsistent metadata: phys_dim_base={phys_dim_base}, max_species={max_species}"
         )
-    if phys_dim_base > phys_dim:
+    if phys_dim_base > phys_dim_core:
         raise ValueError(
-            f"Invalid dimensions: phys_dim_base={phys_dim_base} exceeds phys_dim={phys_dim}"
+            f"Invalid dimensions: phys_dim_base={phys_dim_base} exceeds phys_dim_core={phys_dim_core}"
         )
 
-    extra_dim = phys_dim - phys_dim_base
+    if phys_norm_dim != phys_dim_core:
+        raise ValueError(
+            f"Normalizer dimension mismatch: expected phys_dim_core={phys_dim_core}, got {phys_norm_dim}"
+        )
+
+    expected_phys_dim = phys_dim_core * (2 if param_mask_features else 1)
+    if expected_phys_dim != phys_dim:
+        raise ValueError(
+            f"Conditioning dim mismatch: expected phys_dim={expected_phys_dim} from metadata, got {phys_dim}"
+        )
+
+    extra_dim = phys_dim_core - phys_dim_base
     n_tasks = int(model_meta.get("n_tasks", 0)) if model_meta else 0
     n_stages = int(model_meta.get("n_stages", 0)) if model_meta else 0
 
@@ -507,11 +540,14 @@ def _resolve_model_geometry(norm: tuple[jax.Array, ...], model_meta: dict[str, A
         "state_dim": state_dim,
         "target_len": target_len,
         "phys_dim": phys_dim,
+        "phys_dim_core": phys_dim_core,
         "phys_dim_base": phys_dim_base,
         "max_species": max_species,
         "nx": nx,
         "n_tasks": n_tasks,
         "n_stages": n_stages,
+        "param_mask_features": param_mask_features,
+        "signal_channels": signal_channels,
         "task_names": task_names,
         "stage_names": stage_names,
     }
@@ -566,6 +602,7 @@ def main():
         depth=depth,
         cond_dim=cond_dim,
         phys_dim=int(geometry["phys_dim"]),
+        signal_channels=int(geometry["signal_channels"]),
         key=subkey,
     )
     model = eqx.tree_deserialise_leaves(checkpoint_path, model)
@@ -574,7 +611,9 @@ def main():
         "Loaded model with dimensions: "
         f"state_dim={geometry['state_dim']}, max_species={geometry['max_species']}, "
         f"nx={geometry['nx']}, target_len={geometry['target_len']}, phys_dim={geometry['phys_dim']}, "
-        f"phys_dim_base={geometry['phys_dim_base']}, tasks={geometry['n_tasks']}, "
+        f"phys_dim_core={geometry['phys_dim_core']}, phys_dim_base={geometry['phys_dim_base']}, "
+        f"signal_channels={geometry['signal_channels']}, param_mask_features={geometry['param_mask_features']}, "
+        f"tasks={geometry['n_tasks']}, "
         f"stages={geometry['n_stages']}, hidden_size={hidden_size}, depth={depth}"
     )
 
@@ -613,6 +652,9 @@ def main():
         int(geometry["target_len"]),
         int(geometry["n_tasks"]),
         int(geometry["n_stages"]),
+        int(geometry["phys_dim_core"]),
+        bool(geometry["param_mask_features"]),
+        int(geometry["signal_channels"]),
         list(geometry["task_names"]),
         list(geometry["stage_names"]),
         output_dir,
@@ -644,6 +686,9 @@ def main():
         int(geometry["target_len"]),
         int(geometry["n_tasks"]),
         int(geometry["n_stages"]),
+        int(geometry["phys_dim_core"]),
+        bool(geometry["param_mask_features"]),
+        int(geometry["signal_channels"]),
         list(geometry["task_names"]),
         list(geometry["stage_names"]),
         output_dir,
@@ -665,6 +710,9 @@ def main():
         int(geometry["target_len"]),
         int(geometry["n_tasks"]),
         int(geometry["n_stages"]),
+        int(geometry["phys_dim_core"]),
+        bool(geometry["param_mask_features"]),
+        int(geometry["signal_channels"]),
         list(geometry["task_names"]),
         list(geometry["stage_names"]),
         output_dir,
@@ -692,6 +740,9 @@ def main():
         int(geometry["target_len"]),
         int(geometry["n_tasks"]),
         int(geometry["n_stages"]),
+        int(geometry["phys_dim_core"]),
+        bool(geometry["param_mask_features"]),
+        int(geometry["signal_channels"]),
         list(geometry["task_names"]),
         list(geometry["stage_names"]),
         output_dir,
@@ -713,6 +764,9 @@ def main():
         int(geometry["target_len"]),
         int(geometry["n_tasks"]),
         int(geometry["n_stages"]),
+        int(geometry["phys_dim_core"]),
+        bool(geometry["param_mask_features"]),
+        int(geometry["signal_channels"]),
         list(geometry["task_names"]),
         list(geometry["stage_names"]),
         output_dir,

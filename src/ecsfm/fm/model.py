@@ -8,13 +8,17 @@ class SignalEncoder(eqx.Module):
     into a fixed-size latent representation.
     """
     layers: list
+    input_channels: int = eqx.field(static=True)
     
-    def __init__(self, cond_dim: int, key: jax.random.PRNGKey):
+    def __init__(self, cond_dim: int, key: jax.random.PRNGKey, input_channels: int = 1):
+        if input_channels <= 0:
+            raise ValueError(f"input_channels must be positive, got {input_channels}")
         k1, k2, k3, k4 = jax.random.split(key, 4)
+        self.input_channels = int(input_channels)
         
-        # We expect input of shape (1, seq_len)
+        # We expect input of shape (channels, seq_len)
         self.layers = [
-            eqx.nn.Conv1d(1, 16, kernel_size=5, stride=2, padding=2, key=k1),
+            eqx.nn.Conv1d(self.input_channels, 16, kernel_size=5, stride=2, padding=2, key=k1),
             jax.nn.gelu,
             eqx.nn.Conv1d(16, 32, kernel_size=5, stride=2, padding=2, key=k2),
             jax.nn.gelu,
@@ -27,9 +31,20 @@ class SignalEncoder(eqx.Module):
         ]
         
     def __call__(self, x: jax.Array) -> jax.Array:
-        # Input x is expected to be shape (seq_len,)
-        # Conv1d expects (channels, length), so we reshape
-        x = x.reshape(1, -1)
+        # Input x is expected to be shape (seq_len,) or (channels, seq_len).
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        elif x.ndim != 2:
+            raise ValueError(f"Signal input must be 1D or 2D, got shape {x.shape}")
+
+        if x.shape[0] != self.input_channels:
+            raise ValueError(
+                f"Signal channels mismatch: expected {self.input_channels}, got {x.shape[0]}"
+            )
+
+        conv_dtype = self.layers[0].weight.dtype
+        x = x.astype(conv_dtype)
+
         for layer in self.layers:
             # Special handling to flatten before linear layer
             if isinstance(layer, eqx.nn.Linear):
@@ -46,8 +61,18 @@ class VectorFieldNet(eqx.Module):
     signal_encoder: SignalEncoder
     mlp: eqx.nn.MLP
     time_emb_dim: int = eqx.field(static=True)
+    signal_channels: int = eqx.field(static=True)
     
-    def __init__(self, state_dim: int, hidden_size: int, depth: int, cond_dim: int, phys_dim: int, key: jax.random.PRNGKey):
+    def __init__(
+        self,
+        state_dim: int,
+        hidden_size: int,
+        depth: int,
+        cond_dim: int,
+        phys_dim: int,
+        key: jax.random.PRNGKey,
+        signal_channels: int = 1,
+    ):
         """
         Args:
             state_dim: Dimension of the state vector (e.g. C_ox, C_red, I_hist)
@@ -59,8 +84,13 @@ class VectorFieldNet(eqx.Module):
         """
         k1, k2 = jax.random.split(key)
         self.time_emb_dim = 32
+        self.signal_channels = int(signal_channels)
         
-        self.signal_encoder = SignalEncoder(cond_dim=cond_dim, key=k1)
+        self.signal_encoder = SignalEncoder(
+            cond_dim=cond_dim,
+            key=k1,
+            input_channels=self.signal_channels,
+        )
         
         self.mlp = eqx.nn.MLP(
             in_size=state_dim + self.time_emb_dim + cond_dim + phys_dim,
@@ -97,4 +127,3 @@ class VectorFieldNet(eqx.Module):
         
         # Predict velocity
         return self.mlp(txcp)
-

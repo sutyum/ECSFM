@@ -40,6 +40,22 @@ class FlowConfig(BaseModel):
     new_run: bool = Field(False, description="Start training from scratch, ignoring checkpoints")
     val_split: float = Field(0.2, gt=0.0, lt=1.0, description="Fraction of dataset to use for validation")
     curriculum: bool = Field(True, description="Enable curriculum stage-based sampling when stage labels exist")
+    partial_obs_training: bool = Field(
+        False,
+        description="Enable random masking of signal/conditioning during training for partial-observation robustness",
+    )
+    signal_mask_prob: float = Field(
+        0.15,
+        ge=0.0,
+        le=1.0,
+        description="Per-timepoint masking probability for conditioning signal when partial_obs_training is enabled",
+    )
+    param_mask_prob: float = Field(
+        0.15,
+        ge=0.0,
+        le=1.0,
+        description="Per-parameter masking probability for conditioning vector when partial_obs_training is enabled",
+    )
 
 
 def integrate_flow(model: VectorFieldNet, x0: jax.Array, E: jax.Array, p: jax.Array, n_steps: int = 100) -> jax.Array:
@@ -366,6 +382,52 @@ def _build_task_stage_features(
     return np.concatenate([task_oh, stage_oh], axis=1), n_tasks, n_stages
 
 
+def _build_signal_input(
+    signal_norm: jax.Array,
+    signal_mask: jax.Array | None,
+    signal_channels: int,
+) -> jax.Array:
+    if signal_channels not in (1, 2):
+        raise ValueError(f"signal_channels must be 1 or 2, got {signal_channels}")
+    if signal_norm.ndim != 2:
+        raise ValueError(f"signal_norm must be 2D [batch, len], got shape {signal_norm.shape}")
+
+    if signal_mask is None:
+        signal_mask = jnp.ones_like(signal_norm)
+    elif signal_mask.shape != signal_norm.shape:
+        raise ValueError(
+            f"signal_mask shape mismatch: expected {signal_norm.shape}, got {signal_mask.shape}"
+        )
+
+    signal_mask = signal_mask.astype(signal_norm.dtype)
+    masked_signal = signal_norm * signal_mask
+    if signal_channels == 1:
+        return masked_signal
+    return jnp.stack([masked_signal, signal_mask], axis=1)
+
+
+def _build_param_input(
+    params_norm: jax.Array,
+    param_mask: jax.Array | None,
+    append_mask_features: bool,
+) -> jax.Array:
+    if params_norm.ndim != 2:
+        raise ValueError(f"params_norm must be 2D [batch, dim], got shape {params_norm.shape}")
+
+    if param_mask is None:
+        param_mask = jnp.ones_like(params_norm)
+    elif param_mask.shape != params_norm.shape:
+        raise ValueError(
+            f"param_mask shape mismatch: expected {params_norm.shape}, got {param_mask.shape}"
+        )
+
+    param_mask = param_mask.astype(params_norm.dtype)
+    masked = params_norm * param_mask
+    if append_mask_features:
+        return jnp.concatenate([masked, param_mask], axis=1)
+    return masked
+
+
 def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> None:
     artifact_path = Path(artifact_dir)
     artifact_path.mkdir(parents=True, exist_ok=True)
@@ -419,19 +481,19 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
             n_tasks_hint=n_tasks_hint,
             n_stages_hint=n_stages_hint,
         )
-        params_cond = np.concatenate([params_base.astype(np.float32), task_stage_features], axis=1)
+        params_cond_core = np.concatenate([params_base.astype(np.float32), task_stage_features], axis=1)
     else:
         n_tasks = 0
         n_stages = 0
         task_id = np.zeros((c_ox.shape[0],), dtype=np.int32)
         stage_id = np.zeros((c_ox.shape[0],), dtype=np.int32)
-        params_cond = params_base.astype(np.float32)
+        params_cond_core = params_base.astype(np.float32)
 
     c_ox = jnp.asarray(c_ox)
     c_red = jnp.asarray(c_red)
     curr = jnp.asarray(curr)
     sigs = jnp.asarray(sigs)
-    params_cond = jnp.asarray(params_cond)
+    params_cond_core = jnp.asarray(params_cond_core)
     task_id = jnp.asarray(task_id)
     stage_id = jnp.asarray(stage_id)
 
@@ -441,7 +503,7 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
     indices = jax.random.permutation(subkey, len(dataset_x))
     dataset_x = dataset_x[indices]
     sigs = sigs[indices]
-    params_cond = params_cond[indices]
+    params_cond_core = params_cond_core[indices]
     task_id = task_id[indices]
     stage_id = stage_id[indices]
 
@@ -451,31 +513,49 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
 
     train_x = dataset_x[:-val_size]
     val_x = dataset_x[-val_size:]
-    train_e = sigs[:-val_size]
-    val_e = sigs[-val_size:]
-    train_p = params_cond[:-val_size]
-    val_p = params_cond[-val_size:]
+    train_e_base = sigs[:-val_size]
+    val_e_base = sigs[-val_size:]
+    train_p_core = params_cond_core[:-val_size]
+    val_p_core = params_cond_core[-val_size:]
     train_stage = np.asarray(stage_id[:-val_size])
 
     x_mean = jnp.mean(train_x, axis=0)
     x_std = jnp.std(train_x, axis=0) + 1e-5
-    e_mean = jnp.mean(train_e, axis=0)
-    e_std = jnp.std(train_e, axis=0) + 1e-5
-    p_mean = jnp.mean(train_p, axis=0)
-    p_std = jnp.std(train_p, axis=0) + 1e-5
+    e_mean = jnp.mean(train_e_base, axis=0)
+    e_std = jnp.std(train_e_base, axis=0) + 1e-5
+    p_mean = jnp.mean(train_p_core, axis=0)
+    p_std = jnp.std(train_p_core, axis=0) + 1e-5
 
     train_x = (train_x - x_mean) / x_std
     val_x = (val_x - x_mean) / x_std
-    train_e = (train_e - e_mean) / e_std
-    val_e = (val_e - e_mean) / e_std
-    train_p = (train_p - p_mean) / p_std
-    val_p = (val_p - p_mean) / p_std
+    train_e_base = (train_e_base - e_mean) / e_std
+    val_e_base = (val_e_base - e_mean) / e_std
+    train_p_core = (train_p_core - p_mean) / p_std
+    val_p_core = (val_p_core - p_mean) / p_std
+
+    signal_channels = 2 if config.partial_obs_training else 1
+    append_param_mask_features = bool(config.partial_obs_training)
+    phys_dim_core = int(train_p_core.shape[1])
+    model_phys_dim = phys_dim_core * (2 if append_param_mask_features else 1)
+
+    val_e = _build_signal_input(
+        signal_norm=val_e_base,
+        signal_mask=None,
+        signal_channels=signal_channels,
+    )
+    val_p = _build_param_input(
+        params_norm=val_p_core,
+        param_mask=None,
+        append_mask_features=append_param_mask_features,
+    )
 
     print(f"Train size: {len(train_x)}, Val size: {len(val_x)}")
     print(
         f"Model dimensions: state_dim={state_dim}, max_species={max_species}, "
-        f"nx={nx}, target_len={target_len}, phys_dim={params_cond.shape[1]}, "
-        f"tasks={n_tasks}, stages={n_stages}, curriculum={config.curriculum}"
+        f"nx={nx}, target_len={target_len}, phys_dim={model_phys_dim}, "
+        f"phys_dim_core={phys_dim_core}, signal_channels={signal_channels}, "
+        f"tasks={n_tasks}, stages={n_stages}, curriculum={config.curriculum}, "
+        f"partial_obs_training={config.partial_obs_training}"
     )
 
     save_normalizers(
@@ -512,7 +592,10 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
         "nx": int(nx),
         "target_len": int(target_len),
         "phys_dim_base": int(params_base.shape[1]),
-        "phys_dim": int(params_cond.shape[1]),
+        "phys_dim_core": int(phys_dim_core),
+        "phys_dim": int(model_phys_dim),
+        "param_mask_features": bool(append_param_mask_features),
+        "signal_channels": int(signal_channels),
         "n_tasks": int(n_tasks),
         "n_stages": int(n_stages),
         "cond_dim": 32,
@@ -533,7 +616,8 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
         hidden_size=config.hidden_size,
         depth=config.depth,
         cond_dim=32,
-        phys_dim=params_cond.shape[1],
+        phys_dim=model_phys_dim,
+        signal_channels=signal_channels,
         key=subkey,
     )
 
@@ -579,16 +663,50 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
             epoch_indices = np.asarray(jax.random.permutation(subkey, len(train_x)))
 
         shuffled_x1 = train_x[epoch_indices]
-        shuffled_e = train_e[epoch_indices]
-        shuffled_p = train_p[epoch_indices]
+        shuffled_e_base = train_e_base[epoch_indices]
+        shuffled_p_core = train_p_core[epoch_indices]
 
         epoch_loss = 0.0
         n_batches = 0
 
         for i in range(0, len(shuffled_x1), config.batch_size):
             batch_x1 = shuffled_x1[i : i + config.batch_size]
-            batch_e = shuffled_e[i : i + config.batch_size]
-            batch_p = shuffled_p[i : i + config.batch_size]
+            batch_e_base = shuffled_e_base[i : i + config.batch_size]
+            batch_p_core = shuffled_p_core[i : i + config.batch_size]
+
+            if config.partial_obs_training:
+                key, e_mask_key, p_mask_key = jax.random.split(key, 3)
+                e_keep_prob = 1.0 - config.signal_mask_prob
+                p_keep_prob = 1.0 - config.param_mask_prob
+
+                e_mask = jax.random.bernoulli(
+                    e_mask_key,
+                    p=e_keep_prob,
+                    shape=batch_e_base.shape,
+                ).astype(batch_e_base.dtype)
+                # Keep endpoints observed to avoid fully unanchored signals.
+                e_mask = e_mask.at[:, 0].set(jnp.asarray(1.0, dtype=batch_e_base.dtype))
+                e_mask = e_mask.at[:, -1].set(jnp.asarray(1.0, dtype=batch_e_base.dtype))
+
+                p_mask = jax.random.bernoulli(
+                    p_mask_key,
+                    p=p_keep_prob,
+                    shape=batch_p_core.shape,
+                ).astype(batch_p_core.dtype)
+            else:
+                e_mask = None
+                p_mask = None
+
+            batch_e = _build_signal_input(
+                signal_norm=batch_e_base,
+                signal_mask=e_mask,
+                signal_channels=signal_channels,
+            )
+            batch_p = _build_param_input(
+                params_norm=batch_p_core,
+                param_mask=p_mask,
+                append_mask_features=append_param_mask_features,
+            )
 
             key, sample_key, step_key = jax.random.split(key, 3)
             batch_x0 = jax.random.normal(sample_key, batch_x1.shape)
@@ -742,6 +860,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_false",
         help="Disable curriculum stage-based sampling",
     )
+    parser.add_argument(
+        "--partial-obs-training",
+        action="store_true",
+        default=bool(_cfg(file_defaults, "partial_obs_training", False, aliases=("partial_obs",))),
+        help="Enable random masking of signal/conditioning during training",
+    )
+    parser.add_argument(
+        "--no-partial-obs-training",
+        dest="partial_obs_training",
+        action="store_false",
+        help="Disable random masking of signal/conditioning during training",
+    )
+    parser.add_argument(
+        "--signal-mask-prob",
+        type=float,
+        default=float(_cfg(file_defaults, "signal_mask_prob", 0.15)),
+        help="Per-timepoint masking probability for conditioning signals",
+    )
+    parser.add_argument(
+        "--param-mask-prob",
+        type=float,
+        default=float(_cfg(file_defaults, "param_mask_prob", 0.15)),
+        help="Per-parameter masking probability for conditioning vector",
+    )
     parser.add_argument("--val-split", type=float, default=float(_cfg(file_defaults, "val_split", 0.2)), help="Validation fraction")
 
     return parser.parse_args(argv)
@@ -761,6 +903,9 @@ def main() -> None:
         new_run=args.new_run,
         val_split=args.val_split,
         curriculum=args.curriculum,
+        partial_obs_training=args.partial_obs_training,
+        signal_mask_prob=args.signal_mask_prob,
+        param_mask_prob=args.param_mask_prob,
     )
 
     train_surrogate(config=config, data_path=args.data_path, artifact_dir=args.artifact_dir)

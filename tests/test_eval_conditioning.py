@@ -50,3 +50,37 @@ def test_resolve_model_geometry_supports_multitask_phys_dim():
     assert geometry["nx"] == 8
     assert geometry["n_tasks"] == 8
     assert geometry["n_stages"] == 3
+
+
+def test_resolve_model_geometry_supports_mask_augmented_conditioning():
+    state_dim = 120
+    target_len = 20
+    phys_dim_core = 35 + 8 + 3
+    phys_dim = phys_dim_core * 2
+
+    norm = (
+        jnp.zeros((state_dim,)),
+        jnp.ones((state_dim,)),
+        jnp.zeros((target_len,)),
+        jnp.ones((target_len,)),
+        jnp.zeros((phys_dim_core,)),
+        jnp.ones((phys_dim_core,)),
+    )
+    meta = {
+        "max_species": 5,
+        "phys_dim_base": 35,
+        "phys_dim_core": phys_dim_core,
+        "phys_dim": phys_dim,
+        "n_tasks": 8,
+        "n_stages": 3,
+        "param_mask_features": True,
+        "signal_channels": 2,
+        "task_names": [f"task_{i}" for i in range(8)],
+        "stage_names": ["foundation", "bridge", "frontier"],
+    }
+
+    geometry = _resolve_model_geometry(norm, meta)
+    assert geometry["phys_dim"] == phys_dim
+    assert geometry["phys_dim_core"] == phys_dim_core
+    assert geometry["param_mask_features"] is True
+    assert geometry["signal_channels"] == 2

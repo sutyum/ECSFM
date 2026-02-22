@@ -59,6 +59,19 @@ uv run python -m ecsfm.fm.train \
 
 Use `--no-curriculum` to disable stage-based sampling.
 
+For partial-observation robustness (unknown/missing signal regions and conditioning params), enable masked conditioning:
+
+```bash
+uv run python -m ecsfm.fm.train \
+  --dataset /tmp/ecsfm/dataset_massive \
+  --artifact-dir /tmp/ecsfm \
+  --epochs 500 \
+  --batch-size 32 \
+  --partial-obs-training \
+  --signal-mask-prob 0.15 \
+  --param-mask-prob 0.15
+```
+
 Training artifacts are written to `--artifact-dir`:
 - `surrogate_model.eqx`
 - `training_history.json`

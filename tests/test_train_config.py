@@ -44,6 +44,9 @@ def test_parse_args_uses_config_defaults(tmp_path):
     assert args.new_run is True
     assert np.isclose(args.val_split, 0.33)
     assert args.curriculum is False
+    assert args.partial_obs_training is False
+    assert np.isclose(args.signal_mask_prob, 0.15)
+    assert np.isclose(args.param_mask_prob, 0.15)
 
 
 def test_parse_args_cli_overrides_config(tmp_path):
@@ -53,6 +56,9 @@ def test_parse_args_cli_overrides_config(tmp_path):
         "depth": 3,
         "new_run": True,
         "curriculum": False,
+        "partial_obs_training": True,
+        "signal_mask_prob": 0.2,
+        "param_mask_prob": 0.4,
     }
     config_path.write_text(json.dumps(config), encoding="utf-8")
 
@@ -66,6 +72,9 @@ def test_parse_args_cli_overrides_config(tmp_path):
             "9",
             "--resume",
             "--curriculum",
+            "--no-partial-obs-training",
+            "--signal-mask-prob",
+            "0.05",
         ]
     )
 
@@ -73,6 +82,9 @@ def test_parse_args_cli_overrides_config(tmp_path):
     assert args.depth == 9
     assert args.new_run is False
     assert args.curriculum is True
+    assert args.partial_obs_training is False
+    assert np.isclose(args.signal_mask_prob, 0.05)
+    assert np.isclose(args.param_mask_prob, 0.4)
 
 
 def test_normalizer_and_metadata_roundtrip(tmp_path):
