@@ -285,6 +285,53 @@ Artifacts:
 - `/tmp/ecsfm/echem_benchmarks/canonical_cv_cottrell.png`
 - `/tmp/ecsfm/echem_benchmarks/sensor_bode.png`
 
+### 10) Nature-Style Evidence Package (Simulator + Dataset Generation)
+
+Run the full evidence suite:
+
+```bash
+uv run python scripts/run_nature_evidence_suite.py \
+  --output-dir /tmp/ecsfm/nature_evidence \
+  --dataset-audit-samples 512
+```
+
+Core artifacts:
+- `/tmp/ecsfm/nature_evidence/canonical_benchmarks.json`
+- `/tmp/ecsfm/nature_evidence/multiphysics_benchmarks.json`
+- `/tmp/ecsfm/nature_evidence/convergence_study.json`
+- `/tmp/ecsfm/nature_evidence/dataset_recipe_audit.json`
+- `/tmp/ecsfm/nature_evidence/cv_trace_sweeps.json`
+- `/tmp/ecsfm/nature_evidence/nature_evidence_report.md`
+- `/tmp/ecsfm/nature_evidence/canonical_cv_overlays.png`
+- `/tmp/ecsfm/nature_evidence/simulator_convergence.png`
+- `/tmp/ecsfm/nature_evidence/dataset_scenario_audit.png`
+
+Reviewer-facing notebooks:
+- `notebooks/nature_01_simulator_correctness.ipynb`
+- `notebooks/nature_02_dataset_generation_scenarios.ipynb`
+- `notebooks/nature_03_canonical_scenarios_visualization.ipynb`
+
+### 11) Coupled Multiphysics (Biofouling + Cleaning + Non-Ideal EIS)
+
+Run multiphysics benchmark tests:
+
+```bash
+uv run pytest -q tests/test_multiphysics.py tests/test_multiphysics_benchmarks.py
+```
+
+Generate a multiphysics report with Bode/Nyquist evidence:
+
+```bash
+uv run python scripts/report_multiphysics_benchmarks.py \
+  --output-dir /tmp/ecsfm/multiphysics_benchmarks
+```
+
+Artifacts:
+- `/tmp/ecsfm/multiphysics_benchmarks/multiphysics_benchmarks.json`
+- `/tmp/ecsfm/multiphysics_benchmarks/multiphysics_benchmarks.md`
+- `/tmp/ecsfm/multiphysics_benchmarks/multiphysics_bode.png`
+- `/tmp/ecsfm/multiphysics_benchmarks/multiphysics_nyquist_randles_fit.png`
+
 ## Interactive CV Playground
 
 ```bash
