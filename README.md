@@ -345,6 +345,29 @@ Artifacts:
 - `/tmp/ecsfm/multiphysics_benchmarks/multiphysics_bode.png`
 - `/tmp/ecsfm/multiphysics_benchmarks/multiphysics_nyquist_randles_fit.png`
 
+### 12) Posterior Inference For Unknown Parameters
+
+Infer a posterior over unknown conditioning parameters from partial observed measurements:
+
+```bash
+uv run python scripts/infer_posterior.py \
+  --checkpoint /tmp/ecsfm/surrogate_model.eqx \
+  --measurement /tmp/ecsfm/measurement_case.npz \
+  --output-dir /tmp/ecsfm/posterior_inference \
+  --n-particles 96 \
+  --n-iters 6 \
+  --n-mc 4
+```
+
+Measurement NPZ format:
+- required: `e` (applied potential trace), `i_obs` (observed current trace)
+- optional: `i_mask` (0/1 observed mask), `known_p_core`, `known_p_mask`
+
+Outputs:
+- `/tmp/ecsfm/posterior_inference/posterior_summary.json`
+- `/tmp/ecsfm/posterior_inference/posterior_artifacts.npz`
+- `/tmp/ecsfm/posterior_inference/posterior_predictive.png`
+
 ## Interactive CV Playground
 
 ```bash
