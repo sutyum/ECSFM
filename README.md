@@ -323,6 +323,9 @@ Reviewer-facing notebooks:
 - `notebooks/nature_01_simulator_correctness.ipynb`
 - `notebooks/nature_02_dataset_generation_scenarios.ipynb`
 - `notebooks/nature_03_canonical_scenarios_visualization.ipynb`
+- `notebooks/nature_04_posterior_identifiability_calibration.ipynb`
+- `notebooks/nature_05_posterior_ablation_frontier.ipynb`
+- `notebooks/nature_06_posterior_failure_modes_protocol_design.ipynb`
 
 ### 11) Coupled Multiphysics (Biofouling + Cleaning + Non-Ideal EIS)
 
