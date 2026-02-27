@@ -1,3 +1,4 @@
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -53,7 +54,8 @@ def test_vector_field_net_accepts_two_channel_signal_condition():
     e = jnp.zeros((2, 24), dtype=jnp.float32)
     p = jnp.zeros((10,), dtype=jnp.float32)
 
-    out = model(t, x, e, p)
+    model_eval = eqx.nn.inference_mode(model)
+    out = model_eval(t, x, e, p)
     assert out.shape == (16,)
     assert np.isfinite(np.asarray(out)).all()
 
@@ -75,5 +77,6 @@ def test_vector_field_net_rejects_wrong_signal_channels():
     e = jnp.zeros((24,), dtype=jnp.float32)  # 1-channel input should fail
     p = jnp.zeros((6,), dtype=jnp.float32)
 
+    model_eval = eqx.nn.inference_mode(model)
     with pytest.raises(ValueError, match="Signal channels mismatch"):
-        _ = model(t, x, e, p)
+        _ = model_eval(t, x, e, p)
