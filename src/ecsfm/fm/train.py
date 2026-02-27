@@ -34,11 +34,13 @@ class FlowConfig(BaseModel):
     epochs: int = Field(500, ge=1, description="Number of training epochs")
     batch_size: int = Field(32, ge=1, description="Batch size")
     lr: float = Field(1e-3, gt=0.0, description="Learning rate")
+    weight_decay: float = Field(1e-4, ge=0.0, description="AdamW weight decay")
     hidden_size: int = Field(128, ge=1, description="Hidden size for VectorFieldNet")
     depth: int = Field(3, ge=1, description="Depth for VectorFieldNet")
     seed: int = Field(42, ge=0, description="Random seed")
     new_run: bool = Field(False, description="Start training from scratch, ignoring checkpoints")
     val_split: float = Field(0.2, gt=0.0, lt=1.0, description="Fraction of dataset to use for validation")
+    patience: int = Field(0, ge=0, description="Early stopping patience (0 = disabled)")
     curriculum: bool = Field(True, description="Enable curriculum stage-based sampling when stage labels exist")
     partial_obs_training: bool = Field(
         False,
@@ -62,6 +64,7 @@ def integrate_flow(model: VectorFieldNet, x0: jax.Array, E: jax.Array, p: jax.Ar
     if n_steps <= 0:
         raise ValueError(f"n_steps must be positive, got {n_steps}")
 
+    model_eval = eqx.nn.inference_mode(model)
     dt = 1.0 / n_steps
     x = x0.astype(jnp.float32)
     E = E.astype(jnp.float32)
@@ -70,7 +73,7 @@ def integrate_flow(model: VectorFieldNet, x0: jax.Array, E: jax.Array, p: jax.Ar
     for i in range(n_steps):
         t = i * dt
         t_batch = jnp.full((x.shape[0], 1), t, dtype=x.dtype)
-        v = jax.vmap(model)(t_batch, x, E, p)
+        v = jax.vmap(model_eval)(t_batch, x, E, p)
         x = x + v * dt
     return x
 
@@ -538,16 +541,41 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
     phys_dim_core = int(train_p_core.shape[1])
     model_phys_dim = phys_dim_core * (2 if append_param_mask_features else 1)
 
-    val_e = _build_signal_input(
-        signal_norm=val_e_base,
-        signal_mask=None,
-        signal_channels=signal_channels,
-    )
-    val_p = _build_param_input(
-        params_norm=val_p_core,
-        param_mask=None,
-        append_mask_features=append_param_mask_features,
-    )
+    # Fixed key for deterministic validation masking (reproducible val loss across epochs).
+    val_mask_key = jax.random.PRNGKey(np.uint32(config.seed) ^ np.uint32(0xDEAD))
+
+    def _build_val_inputs(val_e_base_arr, val_p_core_arr):
+        """Build validation inputs with the same masking distribution as training."""
+        if config.partial_obs_training:
+            vk1, vk2 = jax.random.split(val_mask_key)
+            val_e_mask = jax.random.bernoulli(
+                vk1,
+                p=1.0 - config.signal_mask_prob,
+                shape=val_e_base_arr.shape,
+            ).astype(val_e_base_arr.dtype)
+            val_e_mask = val_e_mask.at[:, 0].set(jnp.asarray(1.0, dtype=val_e_base_arr.dtype))
+            val_e_mask = val_e_mask.at[:, -1].set(jnp.asarray(1.0, dtype=val_e_base_arr.dtype))
+            val_p_mask = jax.random.bernoulli(
+                vk2,
+                p=1.0 - config.param_mask_prob,
+                shape=val_p_core_arr.shape,
+            ).astype(val_p_core_arr.dtype)
+        else:
+            val_e_mask = None
+            val_p_mask = None
+        val_e = _build_signal_input(
+            signal_norm=val_e_base_arr,
+            signal_mask=val_e_mask,
+            signal_channels=signal_channels,
+        )
+        val_p = _build_param_input(
+            params_norm=val_p_core_arr,
+            param_mask=val_p_mask,
+            append_mask_features=append_param_mask_features,
+        )
+        return val_e, val_p
+
+    val_e, val_p = _build_val_inputs(val_e_base, val_p_core)
 
     print(f"Train size: {len(train_x)}, Val size: {len(val_x)}")
     print(
@@ -636,7 +664,15 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
         except Exception as exc:
             print(f"Checkpoint load failed ({exc}); starting new run.")
 
-    optimizer = optax.adamw(learning_rate=config.lr)
+    warmup_epochs = max(1, config.epochs // 10)
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=config.lr * 0.1,
+        peak_value=config.lr,
+        warmup_steps=warmup_epochs,
+        decay_steps=config.epochs,
+        end_value=config.lr * 0.01,
+    )
+    optimizer = optax.adamw(learning_rate=schedule, weight_decay=config.weight_decay)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
     @eqx.filter_jit
@@ -645,6 +681,11 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
         updates, opt_state = optimizer.update(grads, opt_state, model)
         model = eqx.apply_updates(model, updates)
         return model, opt_state, loss
+
+    best_val_loss = float("inf")
+    patience_counter = 0
+    best_checkpoint_path = artifact_path / "surrogate_model_best.eqx"
+    checkpoint_interval = max(1, min(500, config.epochs // 10))
 
     pbar = tqdm(range(start_epoch, config.epochs), desc="Training")
     for epoch in pbar:
@@ -721,20 +762,33 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
         avg_loss = epoch_loss / n_batches
         history["train"].append(avg_loss)
 
-        if epoch % 1000 == 0 or epoch == config.epochs - 1:
-            key, sample_key, step_key = jax.random.split(key, 3)
-            val_x0 = jax.random.normal(sample_key, val_x.shape)
-            val_loss = float(compute_val_loss(model, val_x, val_x0, val_e, val_p, step_key))
-            history["val"].append((epoch, val_loss))
-            pbar.set_postfix(
-                {
-                    "train": f"{avg_loss:.5f}",
-                    "val": f"{val_loss:.5f}",
-                    "stage<=": str(allowed_stage),
-                }
-            )
+        # Validate every epoch with inference_mode (dropout disabled)
+        key, sample_key, step_key = jax.random.split(key, 3)
+        val_x0 = jax.random.normal(sample_key, val_x.shape)
+        model_eval = eqx.nn.inference_mode(model)
+        val_loss = float(compute_val_loss(model_eval, val_x, val_x0, val_e, val_p, step_key))
+        history["val"].append((epoch, val_loss))
+        pbar.set_postfix(
+            {
+                "train": f"{avg_loss:.5f}",
+                "val": f"{val_loss:.5f}",
+                "stage<=": str(allowed_stage),
+            }
+        )
 
-        if epoch > start_epoch and epoch % 10000 == 0:
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            eqx.tree_serialise_leaves(best_checkpoint_path, model)
+        else:
+            patience_counter += 1
+
+        if config.patience > 0 and patience_counter >= config.patience:
+            print(f"Early stopping at epoch {epoch} (patience={config.patience})")
+            break
+
+        if epoch > start_epoch and epoch % checkpoint_interval == 0:
             eqx.tree_serialise_leaves(checkpoint_path, model)
             with open(history_path, "w", encoding="utf-8") as f:
                 json.dump({"history": history, "epoch": epoch}, f)
@@ -755,6 +809,14 @@ def train_surrogate(config: FlowConfig, data_path: str, artifact_dir: str) -> No
                 target_len=target_len,
                 output_path=artifact_path / f"surrogate_comparison_ep{epoch}.png",
             )
+
+    # Restore best model if early stopping was used and a best checkpoint exists
+    if best_checkpoint_path.exists():
+        try:
+            model = eqx.tree_deserialise_leaves(best_checkpoint_path, model)
+            print(f"Restored best model (val_loss={best_val_loss:.5f})")
+        except Exception:
+            pass
 
     final_loss = history["train"][-1] if history["train"] else 0.0
     print(f"Final epoch loss: {final_loss:.5f}")
@@ -833,6 +895,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=int(_cfg(file_defaults, "epochs", 500)), help="Training epochs")
     parser.add_argument("--batch-size", type=int, default=int(_cfg(file_defaults, "batch_size", 32)), help="Batch size")
     parser.add_argument("--lr", type=float, default=float(_cfg(file_defaults, "lr", 1e-3)), help="Learning rate")
+    parser.add_argument("--weight-decay", type=float, default=float(_cfg(file_defaults, "weight_decay", 1e-4)), help="AdamW weight decay")
     parser.add_argument("--hidden-size", type=int, default=int(_cfg(file_defaults, "hidden_size", 128)), help="MLP hidden size")
     parser.add_argument("--depth", type=int, default=int(_cfg(file_defaults, "depth", 3)), help="MLP depth")
     parser.add_argument("--seed", type=int, default=int(_cfg(file_defaults, "seed", 42)), help="Random seed")
@@ -885,6 +948,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Per-parameter masking probability for conditioning vector",
     )
     parser.add_argument("--val-split", type=float, default=float(_cfg(file_defaults, "val_split", 0.2)), help="Validation fraction")
+    parser.add_argument("--patience", type=int, default=int(_cfg(file_defaults, "patience", 0)), help="Early stopping patience (0 = disabled)")
 
     return parser.parse_args(argv)
 
@@ -897,11 +961,13 @@ def main() -> None:
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        weight_decay=args.weight_decay,
         hidden_size=args.hidden_size,
         depth=args.depth,
         seed=args.seed,
         new_run=args.new_run,
         val_split=args.val_split,
+        patience=args.patience,
         curriculum=args.curriculum,
         partial_obs_training=args.partial_obs_training,
         signal_mask_prob=args.signal_mask_prob,

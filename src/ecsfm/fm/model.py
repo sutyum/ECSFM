@@ -60,9 +60,10 @@ class VectorFieldNet(eqx.Module):
     """
     signal_encoder: SignalEncoder
     mlp: eqx.nn.MLP
+    dropout: eqx.nn.Dropout
     time_emb_dim: int = eqx.field(static=True)
     signal_channels: int = eqx.field(static=True)
-    
+
     def __init__(
         self,
         state_dim: int,
@@ -72,6 +73,7 @@ class VectorFieldNet(eqx.Module):
         phys_dim: int,
         key: jax.random.PRNGKey,
         signal_channels: int = 1,
+        dropout_rate: float = 0.1,
     ):
         """
         Args:
@@ -81,17 +83,18 @@ class VectorFieldNet(eqx.Module):
             cond_dim: Size of the encoded latent vector from the signal E(t)
             phys_dim: Size of the explicit physical parameter vector p
             key: PRNG key for initialization
+            dropout_rate: Dropout probability applied before the MLP
         """
         k1, k2 = jax.random.split(key)
         self.time_emb_dim = 32
         self.signal_channels = int(signal_channels)
-        
+
         self.signal_encoder = SignalEncoder(
             cond_dim=cond_dim,
             key=k1,
             input_channels=self.signal_channels,
         )
-        
+
         self.mlp = eqx.nn.MLP(
             in_size=state_dim + self.time_emb_dim + cond_dim + phys_dim,
             out_size=state_dim,
@@ -100,8 +103,10 @@ class VectorFieldNet(eqx.Module):
             activation=jax.nn.gelu,
             key=k2
         )
-        
-    def __call__(self, t: float, x: jax.Array, E: jax.Array, p: jax.Array) -> jax.Array:
+
+        self.dropout = eqx.nn.Dropout(p=dropout_rate)
+
+    def __call__(self, t: float, x: jax.Array, E: jax.Array, p: jax.Array, *, key: jax.Array | None = None) -> jax.Array:
         """
         Predicts the vector field at time t, state x, conditioned on signal E and params p.
         Args:
@@ -109,21 +114,25 @@ class VectorFieldNet(eqx.Module):
             x: State array of shape (state_dim,)
             E: Experimental signal array of shape (seq_len,)
             p: Physical parameter array of shape (phys_dim,)
+            key: PRNG key for dropout (required during training, ignored in inference mode)
         """
         # Ensure t is a 1D array of shape (1,)
         t_arr = jnp.atleast_1d(t)
-        
+
         # Sinusoidal time embedding
         half_dim = self.time_emb_dim // 2
         emb_scale = jnp.exp(jnp.arange(half_dim) * -(jnp.log(10000.0) / max(1, half_dim - 1)))
         emb = t_arr * emb_scale
         t_emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)])
-        
+
         # Process the time-series boundary signal E(t) into a fixed-size condition
         c = self.signal_encoder(E)
-        
+
         # Concatenate time, state, compressed signal condition, and physical parameters
         txcp = jnp.concatenate([t_emb, x, c, p])
-        
+
+        # Apply dropout before MLP
+        txcp = self.dropout(txcp, key=key)
+
         # Predict velocity
         return self.mlp(txcp)
