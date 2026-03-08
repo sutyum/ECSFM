@@ -1,16 +1,16 @@
 import jax
 import jax.numpy as jnp
 import equinox as eqx
-from ecsfm.sim.mesh import Mesh1D
+from ecsfm.sim.mesh import Mesh1D, GradedMesh1D
 
 
 class Diffusion1D(eqx.Module):
     """Solves the 1D diffusion equation dC/dt = D * d2C/dx2."""
 
-    mesh: Mesh1D
+    mesh: Mesh1D | GradedMesh1D
     D: float
 
-    def __init__(self, mesh: Mesh1D, D: float):
+    def __init__(self, mesh: Mesh1D | GradedMesh1D, D: float):
         D = float(D)
         if D <= 0:
             raise ValueError(f"D must be positive, got {D}")
@@ -35,12 +35,8 @@ class Diffusion1D(eqx.Module):
         Implicit Backward Euler time step for 1D diffusion.
         Solves: (I - dt * D * Laplacian) C_next = C
         Using Thomas algorithm (tridiagonal matrix solver) for O(N) speed.
-        
-        Args:
-            C: Current concentration array
-            dt: Time step
-            C_surf: Dirichlet boundary condition at x=0
-            C_bulk: Dirichlet boundary condition at x=L
+
+        Supports both uniform (Mesh1D) and non-uniform (GradedMesh1D) meshes.
         """
         nx = C.shape[0]
         if nx < 2:
@@ -48,7 +44,6 @@ class Diffusion1D(eqx.Module):
 
         dtype = C.dtype
         dt = jnp.asarray(dt, dtype=dtype)
-        dx = jnp.asarray(self.mesh.dx, dtype=dtype)
         D = jnp.asarray(self.D, dtype=dtype)
         C_surf = jnp.asarray(C_surf, dtype=dtype)
         C_bulk = jnp.asarray(C_bulk, dtype=dtype)
@@ -56,15 +51,39 @@ class Diffusion1D(eqx.Module):
         two = jnp.asarray(2.0, dtype=dtype)
         zero = jnp.asarray(0.0, dtype=dtype)
 
-        # r = D * dt / dx^2
-        r = D * dt / (dx**2)
+        if hasattr(self.mesh, 'dx_array'):
+            # Non-uniform mesh: variable spacing coefficients
+            h = self.mesh.dx_array.astype(dtype)  # (nx-1,)
+            h_left = h[:-1]   # h_{i-1} for i=1..nx-2
+            h_right = h[1:]   # h_i for i=1..nx-2
 
-        # Tridiagonal Bands:
-        # -r * C_{i-1} + (1 + 2r) * C_i - r * C_{i+1} = C_current_i
-        # Lower diagonal (a), main diagonal (b), upper diagonal (c)
-        a = jnp.full((nx - 1,), -r, dtype=dtype)
-        b = jnp.full((nx,), one + two * r, dtype=dtype)
-        c = jnp.full((nx - 1,), -r, dtype=dtype)
+            # Non-uniform implicit diffusion:
+            # a_i = 2*D*dt / (h_{i-1} * (h_{i-1} + h_i))
+            # c_i = 2*D*dt / (h_i * (h_{i-1} + h_i))
+            # b_i = 1 + a_i + c_i
+            a_interior = two * D * dt / (h_left * (h_left + h_right))
+            c_interior = two * D * dt / (h_right * (h_left + h_right))
+            b_interior = one + a_interior + c_interior
+
+            # Build full tridiagonal bands
+            # Lower diagonal (a): length nx-1, a[i-1] is coeff of C[i-1] in eq i
+            a = jnp.zeros(nx - 1, dtype=dtype)
+            a = a.at[:len(a_interior)].set(-a_interior)  # a[0..nx-3] for equations 1..nx-2
+
+            # Main diagonal (b): length nx
+            b = jnp.ones(nx, dtype=dtype)
+            b = b.at[1:-1].set(b_interior)
+
+            # Upper diagonal (c): length nx-1, c[i] is coeff of C[i+1] in eq i
+            c = jnp.zeros(nx - 1, dtype=dtype)
+            c = c.at[1:].set(-c_interior)  # c[1..nx-2] for equations 1..nx-2
+        else:
+            # Uniform mesh: constant spacing
+            dx = jnp.asarray(self.mesh.dx, dtype=dtype)
+            r = D * dt / (dx**2)
+            a = jnp.full((nx - 1,), -r, dtype=dtype)
+            b = jnp.full((nx,), one + two * r, dtype=dtype)
+            c = jnp.full((nx - 1,), -r, dtype=dtype)
 
         d = jnp.copy(C)
 
@@ -78,10 +97,6 @@ class Diffusion1D(eqx.Module):
         b = b.at[-1].set(one)
         d = d.at[-1].set(C_bulk)
 
-        # JAX doesn't have a built-in tridiagonal solver easily exposed for jit.
-        # We can write a fast custom Thomas algorithm using lax.scan, or use
-        # a standard banded solve if we reshape, but Thomas is incredibly fast.
-
         # Thomas algorithm forward sweep
         def forward_sweep(carry, elems):
             c_prime_prev, d_prime_prev = carry
@@ -93,11 +108,9 @@ class Diffusion1D(eqx.Module):
 
             return (c_prime, d_prime), (c_prime, d_prime)
 
-        # Pad a list to match lengths for scan (a and c are nx-1, so pad them)
         a_padded = jnp.concatenate([jnp.array([zero], dtype=dtype), a])
         c_padded = jnp.concatenate([c, jnp.array([zero], dtype=dtype)])
 
-        # Initial carry for backward sweep (c'_0, d'_0)
         denom_0 = b[0]
         c_prime_0 = c_padded[0] / denom_0
         d_prime_0 = d[0] / denom_0

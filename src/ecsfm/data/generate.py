@@ -88,7 +88,7 @@ def get_eis_waveform(
 
     dt_nyquist_safe = 1.0 / (min_samples_per_cycle * frequency)
     dt = min(1e-3, dt_nyquist_safe)
-    dt = max(dt, 2e-5)
+    dt = max(dt, 1e-6)
 
     t = np.arange(0.0, t_total, dt)
     E = E_dc + amplitude * np.sin(2.0 * np.pi * frequency * t)
@@ -174,9 +174,7 @@ def _sample_task_for_stage(rng: np.random.Generator, stage_id: int, recipe: str)
         hard_pool = ["eis_high_freq", "diffusion_limited", "kinetics_limited", "cv_multispecies", "swv_pulse"]
         return str(rng.choice(hard_pool))
 
-    pool: list[str] = []
-    for sid in range(stage_id + 1):
-        pool.extend(BASE_STAGE_TASKS[sid])
+    pool = BASE_STAGE_TASKS[stage_id]
     return str(rng.choice(pool))
 
 
@@ -267,7 +265,7 @@ def _sample_params_for_task(
 
     if task_name == "cv_reversible":
         k0_arr[:num_active] = [
-            _log_uniform(rng, max(ranges["k0"][0], 1e-2), max(ranges["k0"][1], 2e-1))
+            _log_uniform(rng, 1e-1, max(ranges["k0"][1], 1.0))
             for _ in range(num_active)
         ]
         alpha_arr[:num_active] = rng.uniform(0.45, 0.55, size=num_active)
@@ -326,7 +324,7 @@ def _sample_waveform_for_task(
         return get_eis_waveform(
             E_dc=float(rng.uniform(-0.4, 0.4)),
             amplitude=float(rng.uniform(0.01, 0.08)),
-            frequency=float(rng.uniform(0.1, 20.0)),
+            frequency=float(rng.uniform(1.0, 100.0)),
             t_total=float(rng.uniform(2.0, 4.0)),
             min_samples_per_cycle=30,
         )
@@ -335,8 +333,8 @@ def _sample_waveform_for_task(
     return get_eis_waveform(
         E_dc=float(rng.uniform(-0.3, 0.3)),
         amplitude=float(rng.uniform(0.005, 0.05)),
-        frequency=float(rng.uniform(20.0, 1200.0)),
-        t_total=float(rng.uniform(1.0, 2.5)),
+        frequency=float(rng.uniform(100.0, 25000.0)),
+        t_total=float(rng.uniform(0.05, 0.5)),
         min_samples_per_cycle=25,
     )
 
@@ -369,7 +367,7 @@ def _run_single_sim(args: tuple[np.ndarray, float, tuple[np.ndarray, ...], int])
         noise_std_mA=0.0,
     )
 
-    save_every = max(1, len(E_hist) // 200)
+    save_every = max(1, len(E_hist) // 2048)
     I_total_vis = np.asarray(I_total_mA[::save_every])
 
     return (
@@ -567,6 +565,13 @@ def _simulate_batch_fixed_steps(
         C_ox_next = jax.nn.relu(C_ox_next)
         C_red_next = jax.nn.relu(C_red_next)
 
+        # Mass conservation: enforce C_ox + C_red = C_bulk_ox + C_bulk_red for interior points
+        C_total_bulk = C_bulk_ox_mol + C_bulk_red_mol  # (batch, species)
+        C_total = C_ox_next[:, :, 1:-1] + C_red_next[:, :, 1:-1]  # (batch, species, nx-2)
+        scale = C_total_bulk[:, :, None] / jnp.maximum(C_total, jnp.asarray(1e-30, dtype=dtype))
+        C_ox_next = C_ox_next.at[:, :, 1:-1].set(C_ox_next[:, :, 1:-1] * scale)
+        C_red_next = C_red_next.at[:, :, 1:-1].set(C_red_next[:, :, 1:-1] * scale)
+
         I_species = F * flux * to_mA
         I_t = jnp.sum(I_species, axis=1)
 
@@ -706,10 +711,10 @@ def generate_multi_species_dataset(
     sim_steps: int = 512,
     device_batch_size: int = 128,
     recipe: str = "curriculum_multitask",
-    stage_proportions: tuple[float, float, float] = (0.35, 0.35, 0.30),
+    stage_proportions: tuple[float, float, float] = (0.25, 0.375, 0.375),
     include_invariant_pairs: bool = True,
     invariant_fraction: float = 0.35,
-    target_sig_len: int = 200,
+    target_sig_len: int = 1024,
 ) -> tuple[jnp.ndarray, ...]:
     if n_samples <= 0:
         raise ValueError(f"n_samples must be positive, got {n_samples}")
@@ -896,8 +901,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42, help="Base random seed")
     parser.add_argument("--recipe", choices=["baseline_random", "curriculum_multitask", "stress_mixture"], default="curriculum_multitask", help="Dataset generation recipe")
-    parser.add_argument("--stage-proportions", type=str, default="0.35,0.35,0.30", help="Foundation,bridge,frontier proportions for curriculum recipe")
-    parser.add_argument("--target-sig-len", type=int, default=200, help="Resampled length for current and waveform signals")
+    parser.add_argument("--stage-proportions", type=str, default="0.25,0.375,0.375", help="Foundation,bridge,frontier proportions for curriculum recipe")
+    parser.add_argument("--target-sig-len", type=int, default=1024, help="Resampled length for current and waveform signals")
     parser.add_argument("--invariant-fraction", type=float, default=0.35, help="Probability of adding invariant-augmentation pair per base sample")
     parser.add_argument("--no-invariants", action="store_true", help="Disable invariant pair augmentation")
     parser.add_argument(

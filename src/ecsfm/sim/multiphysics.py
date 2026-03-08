@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ecsfm.sim.mesh import Mesh1D
+from ecsfm.sim.mesh import GradedMesh1D, Mesh1D
 
 
 @dataclass(frozen=True)
@@ -172,6 +172,8 @@ def simulate_multiphysics_electrochem(
     L: float = 0.05,
     nx: int = 200,
     save_every: int | None = 0,
+    grading_factor: float = 0.0,
+    mesh: Mesh1D | GradedMesh1D | None = None,
 ) -> tuple[np.ndarray, ...]:
     """Coupled diffusion + Butler-Volmer + fouling/cleaning + in-loop Ru/Cdl response."""
     cfg = config or MultiPhysicsConfig()
@@ -301,8 +303,15 @@ def simulate_multiphysics_electrochem(
     C_bulk_ox_mol = C_bulk_ox * to_mol_cm3
     C_bulk_red_mol = C_bulk_red * to_mol_cm3
 
-    mesh = Mesh1D(x_min=0.0, x_max=L, n_points=nx, dtype=dtype)
-    dx = jnp.asarray(mesh.dx, dtype=dtype)
+    if mesh is not None:
+        _mesh = mesh
+    elif grading_factor > 0:
+        _mesh = GradedMesh1D(x_min=0.0, x_max=L, n_points=nx, grading_factor=grading_factor, dtype=dtype)
+    else:
+        _mesh = Mesh1D(x_min=0.0, x_max=L, n_points=nx, dtype=dtype)
+
+    dx = jnp.asarray(_mesh.dx, dtype=dtype)
+    is_graded = hasattr(_mesh, 'dx_array')
 
     max_D = jnp.max(jnp.maximum(D_ox, D_red))
     dt = (jnp.asarray(0.1, dtype=dtype) * (dx**2) / max_D) / jnp.asarray(10.0, dtype=dtype)
@@ -323,16 +332,36 @@ def simulate_multiphysics_electrochem(
     E_times = jnp.linspace(0.0, float(t_max), E_array.shape[0], dtype=dtype)
     dt_arr = jnp.asarray(dt_f, dtype=dtype)
 
-    def build_dense_matrix(D: jax.Array) -> jax.Array:
-        r = D * dt_arr / (dx**2)
-        main_diag = jnp.full((nx,), jnp.asarray(1.0, dtype=dtype) + jnp.asarray(2.0, dtype=dtype) * r, dtype=dtype)
-        upper_diag = jnp.full((nx - 1,), -r, dtype=dtype)
-        lower_diag = jnp.full((nx - 1,), -r, dtype=dtype)
-        main_diag = main_diag.at[0].set(jnp.asarray(1.0, dtype=dtype))
-        main_diag = main_diag.at[-1].set(jnp.asarray(1.0, dtype=dtype))
-        upper_diag = upper_diag.at[0].set(jnp.asarray(0.0, dtype=dtype))
-        lower_diag = lower_diag.at[-1].set(jnp.asarray(0.0, dtype=dtype))
-        return jnp.diag(main_diag) + jnp.diag(upper_diag, k=1) + jnp.diag(lower_diag, k=-1)
+    two = jnp.asarray(2.0, dtype=dtype)
+
+    if is_graded:
+        h = _mesh.dx_array.astype(dtype)
+
+        def build_dense_matrix(D: jax.Array) -> jax.Array:
+            h_left = h[:-1]
+            h_right = h[1:]
+            a_int = two * D * dt_arr / (h_left * (h_left + h_right))
+            c_int = two * D * dt_arr / (h_right * (h_left + h_right))
+            b_int = jnp.asarray(1.0, dtype=dtype) + a_int + c_int
+
+            main_diag = jnp.ones(nx, dtype=dtype)
+            main_diag = main_diag.at[1:-1].set(b_int)
+            lower_diag = jnp.zeros(nx - 1, dtype=dtype)
+            lower_diag = lower_diag.at[:len(a_int)].set(-a_int)
+            upper_diag = jnp.zeros(nx - 1, dtype=dtype)
+            upper_diag = upper_diag.at[1:].set(-c_int)
+            return jnp.diag(main_diag) + jnp.diag(upper_diag, k=1) + jnp.diag(lower_diag, k=-1)
+    else:
+        def build_dense_matrix(D: jax.Array) -> jax.Array:
+            r = D * dt_arr / (dx**2)
+            main_diag = jnp.full((nx,), jnp.asarray(1.0, dtype=dtype) + two * r, dtype=dtype)
+            upper_diag = jnp.full((nx - 1,), -r, dtype=dtype)
+            lower_diag = jnp.full((nx - 1,), -r, dtype=dtype)
+            main_diag = main_diag.at[0].set(jnp.asarray(1.0, dtype=dtype))
+            main_diag = main_diag.at[-1].set(jnp.asarray(1.0, dtype=dtype))
+            upper_diag = upper_diag.at[0].set(jnp.asarray(0.0, dtype=dtype))
+            lower_diag = lower_diag.at[-1].set(jnp.asarray(0.0, dtype=dtype))
+            return jnp.diag(main_diag) + jnp.diag(upper_diag, k=1) + jnp.diag(lower_diag, k=-1)
 
     M_ox = jax.vmap(build_dense_matrix)(D_ox)
     M_red = jax.vmap(build_dense_matrix)(D_red)
@@ -516,7 +545,7 @@ def simulate_multiphysics_electrochem(
     I_hist_vis = I_total_hist[::save_every]
 
     return (
-        np.asarray(mesh.x),
+        np.asarray(_mesh.x),
         np.asarray(C_ox_hist),
         np.asarray(C_red_hist),
         np.asarray(E_hist),

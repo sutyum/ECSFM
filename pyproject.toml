@@ -18,8 +18,12 @@ dependencies = [
     "pydantic>=2.0.0",
     "pytest>=8.4.2",
     "scikit-learn>=1.8.0",
+    "streamlit>=1.55.0",
     "tqdm>=4.66.0",
 ]
+
+[project.optional-dependencies]
+comsol = ["mph>=1.2"]
 
 [build-system]
 requires = ["uv_build>=0.10.2,<0.11.0"]

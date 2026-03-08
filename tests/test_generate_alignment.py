@@ -26,6 +26,7 @@ def test_dataset_outputs_stay_aligned_with_params(monkeypatch):
         max_workers=1,
         backend="process_pool",
         include_invariant_pairs=False,
+        target_sig_len=200,
     )
 
     c_ox = np.asarray(c_ox)
